@@ -35,4 +35,7 @@ src/odyssey/   # library package (installable)
 tests/         # pytest suite
 pyproject.toml # project + build metadata
 Makefile       # common commands
+docs/          # project documentation
 ```
+
+See [docs/folder-structure.md](docs/folder-structure.md) for `datasets/`, `checkpoints/`, and `runs/` layout.

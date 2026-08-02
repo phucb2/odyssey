@@ -1,0 +1,10 @@
+defaults:
+  - train
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .

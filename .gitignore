@@ -9,6 +9,14 @@ wheels/
 # Virtual environments
 .venv
 
+# Local datasets, checkpoints, and experiment outputs
+datasets/
+checkpoints/
+runs/
+/data/
+outputs/
+data_*.pt
+
 # Test / tooling
 .pytest_cache/
 .coverage
