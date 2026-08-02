@@ -1,0 +1,41 @@
+[project]
+name = "odyssey"
+version = "0.1.0"
+description = "Odyssey Python library"
+readme = "README.md"
+authors = [
+    { name = "Phuc Bui", email = "buibaphuc95@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "torch>=2.6.0",
+    "transformers>=4.50.0",
+]
+
+[project.scripts]
+odyssey = "odyssey.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv.sources]
+# CUDA builds are not published for macOS; fall back to PyPI there.
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
