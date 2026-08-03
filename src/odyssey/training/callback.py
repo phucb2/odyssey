@@ -6,8 +6,13 @@ import torch
 class Callback(): order = 0
 
 def run_callbacks(cbs, cb_name, learn=None):
+    result = None
     for cb in sorted(cbs, key=lambda x: x.order):
-        if hasattr(cb, cb_name): getattr(cb, cb_name)(learn)
+        if hasattr(cb, cb_name):
+            out = getattr(cb, cb_name)(learn)
+            if out is not None:
+                result = out
+    return result
         
 class CancelFitException(Exception): pass
 class CancelBatchException(Exception): pass

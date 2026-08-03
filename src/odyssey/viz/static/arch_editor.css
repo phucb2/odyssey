@@ -1,0 +1,237 @@
+.odyssey-arch-editor {
+  --oae-bg: #1a1d23;
+  --oae-panel: #232830;
+  --oae-border: #3a424f;
+  --oae-text: #e8ecf1;
+  --oae-muted: #8b95a5;
+  --oae-accent: #3ecfbd;
+  --oae-accent-dim: #2a9a8d;
+  --oae-warn: #e8a838;
+  --oae-err: #e05c5c;
+  font-family: "IBM Plex Mono", "SF Mono", "Consolas", monospace;
+  font-size: 12px;
+  color: var(--oae-text);
+}
+
+.oae-shell {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-width: 960px;
+  min-height: 520px;
+  border: 1px solid var(--oae-border);
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--oae-bg);
+}
+
+.oae-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: var(--oae-panel);
+  border-bottom: 1px solid var(--oae-border);
+}
+
+.oae-title {
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin-right: auto;
+  color: var(--oae-accent);
+}
+
+.oae-toolbar button {
+  background: transparent;
+  border: 1px solid var(--oae-border);
+  color: var(--oae-text);
+  padding: 4px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.oae-toolbar button:hover {
+  border-color: var(--oae-accent);
+  color: var(--oae-accent);
+}
+
+.oae-body {
+  display: grid;
+  grid-template-columns: 120px 1fr 180px;
+  flex: 1;
+  min-height: 440px;
+}
+
+.oae-section-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--oae-muted);
+  padding: 10px 10px 6px;
+}
+
+.oae-palette {
+  background: var(--oae-panel);
+  border-right: 1px solid var(--oae-border);
+  overflow-y: auto;
+}
+
+.oae-palette-btn {
+  display: block;
+  width: calc(100% - 12px);
+  margin: 4px 6px;
+  padding: 6px 8px;
+  text-align: left;
+  background: var(--oae-bg);
+  border: 1px solid var(--oae-border);
+  border-radius: 4px;
+  color: var(--oae-text);
+  cursor: pointer;
+  font: inherit;
+}
+
+.oae-palette-btn:hover {
+  border-color: var(--oae-accent);
+}
+
+.oae-canvas-wrap {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 1px 1px, #2a303a 1px, transparent 0) 0 0 / 18px 18px,
+    var(--oae-bg);
+}
+
+.oae-canvas {
+  width: 100%;
+  height: 100%;
+  min-height: 440px;
+  display: block;
+  cursor: grab;
+}
+
+.oae-canvas:active {
+  cursor: grabbing;
+}
+
+.oae-edge {
+  fill: none;
+  stroke: var(--oae-accent-dim);
+  stroke-width: 2;
+}
+
+.oae-edge-draft {
+  stroke-dasharray: 4 4;
+  stroke: var(--oae-accent);
+}
+
+.oae-node rect {
+  fill: var(--oae-panel);
+  stroke: var(--oae-border);
+  stroke-width: 1;
+}
+
+.oae-node-selected rect {
+  stroke: var(--oae-accent);
+  stroke-width: 2;
+}
+
+.oae-node-title {
+  fill: var(--oae-text);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.oae-node-sub {
+  fill: var(--oae-muted);
+  font-size: 10px;
+}
+
+.oae-port {
+  fill: var(--oae-accent);
+  stroke: var(--oae-bg);
+  stroke-width: 1;
+  cursor: crosshair;
+}
+
+.oae-inspector {
+  background: var(--oae-panel);
+  border-left: 1px solid var(--oae-border);
+  overflow-y: auto;
+}
+
+.oae-inspector-body {
+  padding: 0 10px 10px;
+}
+
+.oae-inspector-title {
+  font-weight: 600;
+  margin-bottom: 8px;
+  color: var(--oae-accent);
+}
+
+.oae-field {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+
+.oae-field span {
+  color: var(--oae-muted);
+  font-size: 10px;
+}
+
+.oae-field input {
+  background: var(--oae-bg);
+  border: 1px solid var(--oae-border);
+  border-radius: 4px;
+  color: var(--oae-text);
+  padding: 4px 6px;
+  font: inherit;
+}
+
+.oae-delete-btn {
+  margin-top: 8px;
+  width: 100%;
+  padding: 6px;
+  background: transparent;
+  border: 1px solid var(--oae-err);
+  color: var(--oae-err);
+  border-radius: 4px;
+  cursor: pointer;
+  font: inherit;
+}
+
+.oae-status {
+  padding: 6px 12px;
+  border-top: 1px solid var(--oae-border);
+  color: var(--oae-muted);
+  min-height: 28px;
+}
+
+.oae-status[data-kind="ok"] {
+  color: var(--oae-accent);
+}
+
+.oae-status[data-kind="warn"] {
+  color: var(--oae-warn);
+}
+
+.oae-status[data-kind="err"] {
+  color: var(--oae-err);
+}
+
+@media (max-width: 720px) {
+  .oae-body {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 320px auto;
+  }
+  .oae-palette,
+  .oae-inspector {
+    border: none;
+    border-bottom: 1px solid var(--oae-border);
+  }
+}

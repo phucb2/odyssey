@@ -64,12 +64,15 @@ class MetricsCB(Callback):
         self.all_metrics['loss'] = self.loss = Mean()
         self.metric_interval = metric_interval
         self._batch_count = 0
-    def before_fit(self, learn): learn.metrics = self
+    def before_fit(self, learn):
+        learn.metrics = self
     def before_epoch(self, learn):
         self._batch_count = 0
+        learn.epoch_metrics = {}
         [o.reset() for o in self.all_metrics.values()]
     def after_epoch(self, learn):
         log={k:f'{v.compute():.4f}' for k,v in self.all_metrics.items()}
+        log.update(getattr(learn, "epoch_metrics", {}))
         log['epoch'] = str(learn.epoch)
         log['train'] = 'train' if learn.model.training else 'valid'
         self._log(log)
@@ -79,7 +82,9 @@ class MetricsCB(Callback):
         self.loss.update(to_cpu(learn.loss), weight=bs)
         update_metrics = not learn.training or (self._batch_count % self.metric_interval == 0)
         self._batch_count += 1
-        if not update_metrics:
+        if not update_metrics or not self.metrics:
+            return
+        if isinstance(learn.preds, dict):
             return
         metric_y = getattr(learn, 'batch_labels', learn.batch[1])
         if isinstance(metric_y, torch.Tensor) and metric_y.ndim > 1:
@@ -87,6 +92,34 @@ class MetricsCB(Callback):
         for m in self.metrics.values(): m.update(to_cpu(learn.preds), to_cpu(metric_y))
     def _log(self, log):
         _console.print(_dict_metrics_table(log))
+
+
+class LossDictMetricsCB(Callback):
+    """Track named components from `learn.loss_dict` into `learn.epoch_metrics`."""
+
+    order = MetricsCB.order - 1
+
+    def __init__(self, keys: tuple[str, ...]):
+        self.keys = keys
+        self._means: dict[str, Mean] = {k: Mean() for k in keys}
+
+    def before_epoch(self, learn):
+        for mean in self._means.values():
+            mean.reset()
+
+    def after_batch(self, learn):
+        loss_dict = getattr(learn, "loss_dict", None)
+        if not loss_dict:
+            return
+        bs = len(learn.batch[0]) if learn.batch else 0
+        for key in self.keys:
+            if key in loss_dict:
+                self._means[key].update(to_cpu(loss_dict[key]), weight=bs)
+
+    def after_epoch(self, learn):
+        learn.epoch_metrics = getattr(learn, "epoch_metrics", {})
+        for key, mean in self._means.items():
+            learn.epoch_metrics[key] = f"{mean.compute():.4f}"
 
 
 default_device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -250,10 +283,10 @@ class MixPrecisionCB(Callback):
         
     def _one_batch(self, learn):
         with torch.autocast('cuda', dtype=torch.float16):
-            learn.preds = learn.model(learn.batch[0])
-            learn.loss = learn.loss_func(learn.preds, learn.batch[1])
+            learn.preds = learn.predict()
+            learn.loss = learn.get_loss()
         if not learn.model.training: return
-        learn.opt.zero_grad(set_to_none=True)
+        learn.zero_grad()
         self.scaler.scale(learn.loss).backward()
         self.scaler.unscale_(learn.opt)
         # learn.clip_grad()

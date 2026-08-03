@@ -1,0 +1,6 @@
+outs:
+- md5: 59cfe2b3c516adc6095f00978af3c73e.dir
+  size: 13986432
+  nfiles: 259
+  hash: md5
+  path: coco128

@@ -6,7 +6,7 @@ readme = "README.md"
 authors = [
     { name = "Phuc Bui", email = "buibaphuc95@gmail.com" }
 ]
-requires-python = ">=3.12.13"
+requires-python = ">=3.12"
 dependencies = [
     "torch>=2.6.0",
     "torchvision>=0.21.0",
@@ -19,6 +19,12 @@ dependencies = [
     "tensorboard>=2.16",
     "omegaconf>=2.3.1",
     "hydra-core>=1.3.0",
+    "scipy>=1.11",
+    "dvc[gdrive,gs]>=3.67.1",
+    "pyopenssl>=24.0.0",
+    "anywidget>=0.9.0",
+    "traitlets>=5.14.0",
+    "ipywidgets>=8.1.0",
 ]
 
 [project.scripts]
@@ -31,6 +37,10 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/odyssey"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/odyssey/viz/static/arch_editor.js" = "odyssey/viz/static/arch_editor.js"
+"src/odyssey/viz/static/arch_editor.css" = "odyssey/viz/static/arch_editor.css"
 
 [tool.hatch.build.targets.sdist]
 include = ["src/odyssey"]

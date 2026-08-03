@@ -5,7 +5,8 @@ DEFAULT_PROJECT = "odyssey"
 
 DATASET_SLUGS = {
     "fashion_mnist": "fashion-mnist",
-    "cifar10": "coco",
+    "cifar10": "cifar10",
+    "coco128": "coco128",
 }
 
 

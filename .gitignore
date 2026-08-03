@@ -10,7 +10,9 @@ wheels/
 .venv
 
 # Local datasets, checkpoints, and experiment outputs
-datasets/
+datasets/*
+!datasets/*.dvc
+!datasets/.gitignore
 checkpoints/
 runs/
 /data/

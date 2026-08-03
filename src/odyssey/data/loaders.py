@@ -1,5 +1,4 @@
 """GPU-preloaded datasets and dataloaders."""
-import os
 from dataclasses import dataclass
 from functools import partial
 
@@ -52,13 +51,7 @@ def _load_torchvision_split(cfg: GpuPreloadConfig, *, train: bool):
     transform = transforms.Compose([transforms.ToTensor()])
     device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
     if cfg.dataset == "cifar10":
-        batches_dir = os.path.join(cfg.root, "cifar-10-batches-py")
-        if not os.path.isdir(batches_dir):
-            raise FileNotFoundError(
-                f"Local CIFAR-10 not found at {batches_dir!r}. "
-                "Place the extracted cifar-10-batches-py folder there (no internet download)."
-            )
-        ds = datasets.CIFAR10(cfg.root, download=False, train=train, transform=transform)
+        ds = datasets.CIFAR10(cfg.root, download=True, train=train, transform=transform)
     elif cfg.dataset == "fashion_mnist":
         ds = datasets.FashionMNIST(cfg.root, download=True, train=train, transform=transform)
     else:

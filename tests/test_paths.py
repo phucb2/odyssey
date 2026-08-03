@@ -15,6 +15,11 @@ def test_dataset_paths() -> None:
         "fashion-mnist",
         "raw",
     )
+    assert Path(default_data_root("cifar10")).parts[-3:] == (
+        "datasets",
+        "cifar10",
+        "raw",
+    )
     cache = Path(default_gpu_cache_path("fashion_mnist"))
     assert cache.parts[-3:] == ("fashion-mnist", "processed", "fashion_mnist.pt")
 

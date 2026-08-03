@@ -6,14 +6,17 @@ Reference for on-disk layout used by Odyssey training. Paths are resolved from t
 
 ```
 ├── datasets/
-│   ├── coco/
-│   │   ├── raw/          # CIFAR-10 batches (cifar-10-batches-py/) or COCO downloads
+│   ├── cifar10/
+│   │   ├── raw/          # torchvision CIFAR-10 download root
 │   │   ├── processed/    # GPU-preloaded .pt cache
-│   │   └── manifests/    # splits, labels, metadata (optional)
+│   │   └── manifests/    # optional metadata
 │   └── fashion-mnist/
 │       ├── raw/          # torchvision FashionMNIST download root
 │       ├── processed/    # GPU-preloaded .pt cache (e.g. fashion_mnist.pt)
 │       └── manifests/
+│   └── coco128/
+│       ├── raw/          # Ultralytics coco128 zip extract (images/, labels/)
+│       └── manifests/    # optional metadata
 ├── checkpoints/
 │   └── odyssey/          # model weights (*.pt, *.pth); project name is configurable
 └── runs/
@@ -38,7 +41,8 @@ Reference for on-disk layout used by Odyssey training. Paths are resolved from t
 - Project name: `odyssey` (`TrainConfig.project_name` or `--project-name`)
 - Fashion-MNIST raw root: `datasets/fashion-mnist/raw/`
 - Fashion-MNIST GPU cache: `datasets/fashion-mnist/processed/fashion_mnist.pt`
-- CIFAR-10 uses `datasets/coco/raw/` (place `cifar-10-batches-py` there)
+- CIFAR-10 auto-downloads to `datasets/cifar10/raw/` on first run (`mltrain model=resnet dataset=cifar10`)
+- coco128 auto-downloads to `datasets/coco128/raw/` on first DETR run (`mltrain task=detr dataset=coco128`)
 
 ## Git
 

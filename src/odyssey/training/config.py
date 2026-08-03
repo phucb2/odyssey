@@ -33,9 +33,22 @@ class AnalysisConfig:
 
 
 @dataclass
+class DetrConfig:
+    num_queries: int = 50
+    num_classes: int = 80
+    d_model: int = 256
+    freeze_backbone: bool = True
+    enc_layers: int = 2
+    dec_layers: int = 2
+    score_threshold: float = 0.05
+
+
+@dataclass
 class TrainConfig:
     mode: str = "train"
+    task: str = "classification"
     project_name: str = DEFAULT_PROJECT
+    model: str = "cnn"
     epochs: int = 10
     lr: float = 1e-2
     init: str | None = None
@@ -46,7 +59,6 @@ class TrainConfig:
     data_location: str | None = None
     fp16_data: bool = True
     one_hot_targets: bool = False
-    wide_resnet: bool = False
     width_mult: float = 2.0
     no_aug: bool = False
     pad_amount: int = 2
@@ -59,6 +71,7 @@ class TrainConfig:
     compile_warmup_batches: int = 4
     grad_clip_norm: float | None = None
     grad_clip_value: float | None = None
+    detr: DetrConfig = field(default_factory=DetrConfig)
     loader: LoaderConfig = field(default_factory=LoaderConfig)
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)
 
@@ -66,12 +79,20 @@ class TrainConfig:
 def _validate_train_config(cfg: TrainConfig) -> None:
     if cfg.mode not in {"train", "analysis"}:
         raise ValueError(f"mode must be 'train' or 'analysis', got {cfg.mode!r}")
+    if cfg.task not in {"classification", "detr"}:
+        raise ValueError(f"task must be 'classification' or 'detr', got {cfg.task!r}")
+    if cfg.task == "classification" and cfg.model not in {"cnn", "resnet"}:
+        raise ValueError(f"classification model must be 'cnn' or 'resnet', got {cfg.model!r}")
     if cfg.init is not None and cfg.init not in _INIT_PRESETS:
         raise ValueError(f"Unknown init preset {cfg.init!r}; choose from {tuple(_INIT_PRESETS)}")
 
 
 def _default_image_size(dataset: str) -> int:
-    return 28 if dataset == "fashion_mnist" else 32
+    if dataset == "fashion_mnist":
+        return 28
+    if dataset == "coco128":
+        return 320
+    return 32
 
 
 def apply_path_defaults(cfg: TrainConfig) -> TrainConfig:

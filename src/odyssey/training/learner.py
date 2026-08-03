@@ -19,7 +19,7 @@ class Learner:
         fc.store_attr()
         self.scheduler_kwargs = skw
         
-    def callbacks(self, method): run_callbacks(self.cbs, method, self)
+    def callbacks(self, method): return run_callbacks(self.cbs, method, self)
     
     @contextmanager
     def cb_ctx(self, name, cancel_exc):
