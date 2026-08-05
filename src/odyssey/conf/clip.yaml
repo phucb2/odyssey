@@ -1,0 +1,11 @@
+# Hydra entry for CLIP experiment: compose with `compose_clip_config(...)`.
+defaults:
+  - clip_config
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .

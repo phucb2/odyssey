@@ -49,6 +49,7 @@ def build_detr_learner(cfg: TrainConfig, *, plot_progress: bool = True) -> Learn
     ]
     if cfg.grad_clip_norm is not None or cfg.grad_clip_value is not None:
         cbs.append(GradClipCB(max_norm=cfg.grad_clip_norm, max_value=cfg.grad_clip_value))
+        
     lr_find = LRFind(
         n_epochs=cfg.analysis.lr_epochs,
         lr_mult=cfg.analysis.lr_mult,
@@ -56,6 +57,7 @@ def build_detr_learner(cfg: TrainConfig, *, plot_progress: bool = True) -> Learn
         show_plot=cfg.analysis.show_plot,
         save_path=cfg.analysis.lr_save,
     )
+    
     learn = Learner(
         model,
         dls,
@@ -68,4 +70,5 @@ def build_detr_learner(cfg: TrainConfig, *, plot_progress: bool = True) -> Learn
     )
     learn.pin_memory = cfg.loader.pin_memory
     learn.project_name = cfg.project_name
+
     return learn
