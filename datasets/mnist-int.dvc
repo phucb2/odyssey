@@ -1,0 +1,6 @@
+outs:
+- md5: 99a94f4094b63b792e7f89eef55af5bf.dir
+  size: 1464031
+  nfiles: 2001
+  hash: md5
+  path: mnist-int
