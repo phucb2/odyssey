@@ -14,16 +14,7 @@ from torchvision.io import read_image
 
 from odyssey.paths import DEFAULT_PROJECT, checkpoint_path, dataset_processed_dir
 from odyssey.training.callback import Callback
-from odyssey.training.callbacks import (
-    ChannelsLastCB,
-    CompileCB,
-    DeviceCB,
-    LRFind,
-    MetricsCB,
-    MixPrecisionCB,
-    ProgressCB,
-    TimingCB,
-)
+from odyssey.training.callbacks import DeviceCB, TrainCB, default_cbs, make_lr_find
 from odyssey.training.learner import Learner
 
 _CLIP_CONFIG_REGISTERED = False
@@ -46,8 +37,8 @@ class ImageEncoderConfig:
 class TextEncoderConfig:
     max_len: int = 77
     d_model: int = 256
-    nhead: int = 4
-    num_layers: int = 4
+    nhead: int = 8
+    num_layers: int = 8
     dim_feedforward: int = 512
     dropout: float = 0.2
 
@@ -76,6 +67,7 @@ class FitConfig:
     epochs: int = 5
     lr: float = 3e-4
     weight_decay: float = 0.05
+    grad_accum: int = 1
     compile: bool = False
     compile_mode: str = "default"
     project_name: str = "odyssey"
@@ -389,7 +381,7 @@ class ClipDataLoaders:
     valid: DataLoader
 
 
-class ClipTrainCB(Callback):
+class ClipTrainCB(TrainCB):
     """CLIP forward returns contrastive loss; wire it into Learner predict/get_loss."""
 
     def predict(self, learn):
@@ -397,15 +389,6 @@ class ClipTrainCB(Callback):
 
     def get_loss(self, learn):
         return learn.preds
-
-    def backward(self, learn):
-        learn.loss.backward()
-
-    def step(self, learn):
-        learn.opt.step()
-
-    def zero_grad(self, learn):
-        learn.opt.zero_grad(set_to_none=True)
 
 
 class ClipImageAugmentCB(Callback):
@@ -487,23 +470,22 @@ def build_clip_learner(cfg: ClipConfig, *, plot_progress: bool = True) -> Learne
     """Construct a Learner for CLIP using the shared callback stack."""
     dls, tokenizer = create_clip_dls(cfg)
     model = CLIP(tokenizer, cfg)
-    cbs = [
-        CompileCB(mode=cfg.fit.compile_mode, enabled=cfg.fit.compile),
-        TimingCB(),
-        MetricsCB(),
-        DeviceCB(),
-        ClipImageAugmentCB(
-            enabled=cfg.data.augment,
-            max_translate=cfg.data.aug_translate,
-            noise_std=cfg.data.aug_noise,
-            jitter=cfg.data.aug_jitter,
-        ),
-        ChannelsLastCB(),
-        ProgressCB(plot=plot_progress),
-        MixPrecisionCB(),
-        ClipTrainCB(),
-    ]
-    lr_find = LRFind(show_plot=plot_progress)
+    cbs = default_cbs(
+        train=ClipTrainCB(),
+        compile=cfg.fit.compile,
+        compile_mode=cfg.fit.compile_mode,
+        channels_last=True,
+        plot_progress=plot_progress,
+        grad_accum=cfg.fit.grad_accum,
+        after_device=[
+            ClipImageAugmentCB(
+                enabled=cfg.data.augment,
+                max_translate=cfg.data.aug_translate,
+                noise_std=cfg.data.aug_noise,
+                jitter=cfg.data.aug_jitter,
+            ),
+        ],
+    )
     opt_func = partial(torch.optim.AdamW, weight_decay=cfg.fit.weight_decay)
     learn = Learner(
         model,
@@ -512,10 +494,10 @@ def build_clip_learner(cfg: ClipConfig, *, plot_progress: bool = True) -> Learne
         opt_func=opt_func,
         lr=cfg.fit.lr,
         cbs=cbs,
-        lr_find=lr_find,
+        lr_find=make_lr_find(show_plot=plot_progress),
+        pin_memory=cfg.data.pin_memory,
+        project_name=cfg.fit.project_name or DEFAULT_PROJECT,
     )
-    learn.pin_memory = cfg.data.pin_memory
-    learn.project_name = cfg.fit.project_name or DEFAULT_PROJECT
     learn.tokenizer = tokenizer
     return learn
 

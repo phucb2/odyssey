@@ -78,7 +78,7 @@ def build_scheduler(scheduler, opt, *, n_epochs, steps_per_epoch, lr, **kwargs):
 
 
 class SchedulerCB(Callback):
-    "Step LR scheduler each batch (OneCycle / warmup cosine) or each valid epoch (others)."
+    "Step LR scheduler after each optimizer step (OneCycle / warmup cosine) or each valid epoch (others)."
     order = 1
 
     def __init__(self, scheduler):
@@ -88,7 +88,7 @@ class SchedulerCB(Callback):
     def before_fit(self, learn):
         learn.sched = self.scheduler
 
-    def after_batch(self, learn):
+    def after_optimizer_step(self, learn):
         if self._per_batch and learn.training:
             self.scheduler.step()
 

@@ -71,6 +71,7 @@ class TrainConfig:
     compile_warmup_batches: int = 4
     grad_clip_norm: float | None = None
     grad_clip_value: float | None = None
+    grad_accum: int = 1
     detr: DetrConfig = field(default_factory=DetrConfig)
     loader: LoaderConfig = field(default_factory=LoaderConfig)
     analysis: AnalysisConfig = field(default_factory=AnalysisConfig)

@@ -278,25 +278,94 @@ def clip_gradients(params, *, max_norm=None, max_value=None):
         nn.utils.clip_grad_value_(grads, max_value)
 
 class MixPrecisionCB(Callback):
+    "CUDA AMP via callback hooks; composes with GradAccumCB and GradClipCB."
+
+    order = -1
+
     def __init__(self):
-        self.scaler = torch.amp.GradScaler('cuda', enabled=True)
-        
-    def _one_batch(self, learn):
-        with torch.autocast('cuda', dtype=torch.float16):
-            learn.preds = learn.predict()
-            learn.loss = learn.get_loss()
-        if not learn.model.training: return
-        learn.zero_grad()
+        self._enabled = False
+        self._autocast = None
+
+    def before_fit(self, learn):
+        device = getattr(learn, "device", default_device)
+        self._enabled = getattr(device, "type", None) == "cuda"
+        if self._enabled:
+            learn._use_amp = True
+            self.scaler = torch.amp.GradScaler("cuda", enabled=True)
+
+    def before_batch(self, learn):
+        if self._enabled and learn.model.training:
+            self._autocast = torch.autocast("cuda", dtype=torch.float16)
+            self._autocast.__enter__()
+        else:
+            self._autocast = None
+
+    def after_batch(self, learn):
+        if self._autocast is not None:
+            self._autocast.__exit__(None, None, None)
+            self._autocast = None
+
+    def backward(self, learn):
+        if not self._enabled:
+            return
         self.scaler.scale(learn.loss).backward()
+
+    def step(self, learn):
+        if not self._enabled or not getattr(learn, "should_step", True):
+            return
         self.scaler.unscale_(learn.opt)
-        # learn.clip_grad()
+        learn.clip_grad()
         self.scaler.step(learn.opt)
         self.scaler.update()
-        
+
+    def zero_grad(self, learn):
+        if not self._enabled or not getattr(learn, "should_step", True):
+            return
+        learn.opt.zero_grad(set_to_none=True)
+
+
+class GradAccumCB(Callback):
+    "Accumulate gradients over micro-batches; step every `n_accum` train batches."
+
+    order = -1
+
+    def __init__(self, n_accum=2, *, scale_loss=True, step_on_epoch_end=True):
+        if n_accum < 1:
+            raise ValueError(f"n_accum must be >= 1, got {n_accum}")
+        fc.store_attr()
+
     def before_fit(self, learn):
-        learn.one_batch = partial(self._one_batch, learn)
-        
-    
+        learn.n_accum = self.n_accum
+        learn.accum_step = 0
+        learn.should_step = self.n_accum == 1
+
+    def before_epoch(self, learn):
+        learn.accum_step = 0
+        learn.should_step = self.n_accum == 1
+
+    def before_backward(self, learn):
+        if self.scale_loss and self.n_accum > 1:
+            learn.loss = learn.loss / self.n_accum
+
+    def after_backward(self, learn):
+        learn.accum_step += 1
+        learn.should_step = learn.accum_step >= self.n_accum
+
+    def after_batch(self, learn):
+        if not learn.training or not learn.should_step:
+            return
+        learn.accum_step = 0
+        learn.should_step = False
+
+    def after_epoch(self, learn):
+        if not learn.training or not self.step_on_epoch_end or learn.accum_step <= 0:
+            return
+        learn.should_step = True
+        learn._optimizer_step()
+        learn.accum_step = 0
+        learn.should_step = False
+
+
 class ProgressCB(Callback):
     order = MetricsCB.order+1
     def __init__(self, plot=False, min_refresh_interval=None):
@@ -643,17 +712,101 @@ class LRFind:
 
     __call__ = run
 
+
+def make_lr_find(
+    analysis=None,
+    *,
+    n_epochs: int = 1,
+    lr_mult: float = 1.3,
+    start_lr: float | None = None,
+    show_plot: bool = True,
+    save_path: str | None = None,
+) -> LRFind:
+    "Build LRFind from AnalysisConfig or explicit kwargs."
+    if analysis is not None:
+        return LRFind(
+            n_epochs=analysis.lr_epochs,
+            lr_mult=analysis.lr_mult,
+            start_lr=analysis.lr,
+            show_plot=analysis.show_plot,
+            save_path=analysis.lr_save,
+        )
+    return LRFind(
+        n_epochs=n_epochs,
+        lr_mult=lr_mult,
+        start_lr=start_lr,
+        show_plot=show_plot,
+        save_path=save_path,
+    )
+
+
+def default_cbs(
+    *,
+    train: Callback,
+    metrics: dict | None = None,
+    compile: bool = False,
+    compile_mode: str = "default",
+    compile_warmup_batches: int | None = None,
+    include_compile_cb: bool = True,
+    channels_last: bool = False,
+    plot_progress: bool = True,
+    grad_clip_norm: float | None = None,
+    grad_clip_value: float | None = None,
+    grad_accum: int = 1,
+    before_metrics: list | None = None,
+    after_device: list | None = None,
+) -> list:
+    "Standard callback stack shared by classification, DETR, and CLIP builders."
+    cbs: list = []
+    if include_compile_cb:
+        cbs.append(CompileCB(mode=compile_mode, enabled=compile))
+    cbs.append(TimingCB())
+    if before_metrics:
+        cbs.extend(before_metrics)
+    cbs.append(MetricsCB(**(metrics or {})))
+    cbs.append(DeviceCB())
+    if after_device:
+        cbs.extend(after_device)
+    if channels_last:
+        cbs.append(ChannelsLastCB())
+    cbs.append(ProgressCB(plot=plot_progress))
+    cbs.append(MixPrecisionCB())
+    if compile_warmup_batches is not None:
+        cbs.append(CompileWarmupCB(n_batches=compile_warmup_batches))
+    if grad_accum > 1:
+        cbs.append(GradAccumCB(n_accum=grad_accum))
+    cbs.append(train)
+    if grad_clip_norm is not None or grad_clip_value is not None:
+        cbs.append(GradClipCB(max_norm=grad_clip_norm, max_value=grad_clip_value))
+    return cbs
+
+
 class TrainCB(Callback):
     def predict(self, learn):
         return learn.model(learn.batch[0])
+
     def get_loss(self, learn):
         return learn.loss_func(learn.preds, learn.batch[1])
+
     def backward(self, learn):
+        if getattr(learn, "_use_amp", False):
+            return
         learn.loss.backward()
+
     def step(self, learn):
+        if not getattr(learn, "should_step", True):
+            return
+        if getattr(learn, "_use_amp", False):
+            return
         learn.opt.step()
+
     def zero_grad(self, learn):
+        if not getattr(learn, "should_step", True):
+            return
+        if getattr(learn, "_use_amp", False):
+            return
         learn.opt.zero_grad(set_to_none=True)
+
 
 class GradClipCB(Callback):
     "Clip gradients after backward; use with MixPrecisionCB (unscale runs before this hook)."
@@ -666,6 +819,8 @@ class GradClipCB(Callback):
         self.max_value = max_value
 
     def clip_grad(self, learn):
+        if not getattr(learn, "should_step", True):
+            return
         clip_gradients(learn.model.parameters(), max_norm=self.max_norm, max_value=self.max_value)
 
 

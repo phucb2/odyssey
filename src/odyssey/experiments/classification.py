@@ -7,19 +7,7 @@ from odyssey.data.augment import AugmentConfig, soft_cross_entropy
 from odyssey.data.loaders import GpuPreloadConfig, create_gpu_dls, default_gpu_cache_path
 from odyssey.experiments.registry import register_task
 from odyssey.models import create_cnn_model, create_res_model
-from odyssey.training.callbacks import (
-    ChannelsLastCB,
-    CompileCB,
-    CompileWarmupCB,
-    DeviceCB,
-    GradClipCB,
-    LRFind,
-    MetricsCB,
-    MixPrecisionCB,
-    ProgressCB,
-    TimingCB,
-    TrainCB,
-)
+from odyssey.training.callbacks import TrainCB, default_cbs, make_lr_find
 from odyssey.training.config import TrainConfig
 from odyssey.training.learner import Learner
 
@@ -61,30 +49,22 @@ def build_classification_learner(cfg: TrainConfig, *, plot_progress: bool = True
     )
     dls = create_gpu_dls(bs=cfg.batch_size, preload=preload, aug=aug)
     loss_func = soft_cross_entropy if use_one_hot else F.cross_entropy
-    cbs = [
-        CompileCB(mode=cfg.compile_mode, enabled=cfg.compile),
-        TimingCB(),
-        MetricsCB(accuracy=MulticlassAccuracy(num_classes=10)),
-        DeviceCB(),
-        ChannelsLastCB(),
-        ProgressCB(plot=plot_progress),
-        MixPrecisionCB(),
-        CompileWarmupCB(n_batches=cfg.compile_warmup_batches if cfg.compile else 0),
-        TrainCB(),
-    ]
-    if cfg.grad_clip_norm is not None or cfg.grad_clip_value is not None:
-        cbs.append(GradClipCB(max_norm=cfg.grad_clip_norm, max_value=cfg.grad_clip_value))
-    lr_find = LRFind(
-        n_epochs=cfg.analysis.lr_epochs,
-        lr_mult=cfg.analysis.lr_mult,
-        start_lr=cfg.analysis.lr,
-        show_plot=cfg.analysis.show_plot,
-        save_path=cfg.analysis.lr_save,
+    cbs = default_cbs(
+        train=TrainCB(),
+        metrics=dict(accuracy=MulticlassAccuracy(num_classes=10)),
+        compile=cfg.compile,
+        compile_mode=cfg.compile_mode,
+        compile_warmup_batches=cfg.compile_warmup_batches if cfg.compile else 0,
+        channels_last=True,
+        plot_progress=plot_progress,
+        grad_clip_norm=cfg.grad_clip_norm,
+        grad_clip_value=cfg.grad_clip_value,
+        grad_accum=cfg.grad_accum,
     )
     learn = Learner(
         model, dls, loss_func, torch.optim.AdamW,
-        lr=cfg.lr, cbs=cbs, init=cfg.init, lr_find=lr_find,
+        lr=cfg.lr, cbs=cbs, init=cfg.init, lr_find=make_lr_find(cfg.analysis),
+        pin_memory=cfg.loader.pin_memory,
+        project_name=cfg.project_name,
     )
-    learn.pin_memory = cfg.loader.pin_memory
-    learn.project_name = cfg.project_name
     return learn

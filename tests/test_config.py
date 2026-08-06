@@ -38,3 +38,8 @@ def test_compose_train_config_cifar_image_size():
     cfg = compose_train_config(["dataset=cifar10"])
     assert cfg.image_size == 32
     assert cfg.data_root == default_data_root("cifar10")
+
+
+def test_compose_train_config_grad_accum():
+    cfg = compose_train_config(["grad_accum=4"])
+    assert cfg.grad_accum == 4

@@ -47,6 +47,7 @@ Reference for on-disk layout used by Odyssey training. Paths are resolved from t
 - CIFAR-10 auto-downloads to `datasets/cifar10/raw/` on first run (`mltrain model=resnet dataset=cifar10`)
 - coco128 auto-downloads to `datasets/coco128/raw/` on first DETR run (`mltrain task=detr dataset=coco128`)
 - MNIST int-images: generate with `python -m odyssey.experiments.mnist_int --generate` → `datasets/mnist_int/processed/` (see [mnist_int.md](mnist_int.md))
+- Gradient accumulation: see [gradient-accumulation.md](gradient-accumulation.md) (`grad_accum=4` via Hydra)
 
 ## Git
 

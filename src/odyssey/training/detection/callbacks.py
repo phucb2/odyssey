@@ -1,10 +1,10 @@
 """DETR-specific training callbacks."""
 from odyssey.training.callback import Callback
-from odyssey.training.callbacks import LossDictMetricsCB, MetricsCB
+from odyssey.training.callbacks import LossDictMetricsCB, MetricsCB, TrainCB
 from odyssey.training.detection.metrics import DetectionMapMetric
 
 
-class DetrTrainCB(Callback):
+class DetrTrainCB(TrainCB):
     def predict(self, learn):
         return learn.model(learn.batch[0])
 
@@ -12,15 +12,6 @@ class DetrTrainCB(Callback):
         loss, loss_dict = learn.loss_func(learn.preds, learn.batch[1])
         learn.loss_dict = loss_dict
         return loss
-
-    def backward(self, learn):
-        learn.loss.backward()
-
-    def step(self, learn):
-        learn.opt.step()
-
-    def zero_grad(self, learn):
-        learn.opt.zero_grad(set_to_none=True)
 
 
 class DetrLossMetricsCB(LossDictMetricsCB):
