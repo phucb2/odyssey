@@ -1,0 +1,11 @@
+# Hydra entry for scratch Qwen3 LM: compose with `compose_qwen3_scratch_config(...)`.
+defaults:
+  - qwen3_scratch_config
+  - _self_
+
+hydra:
+  job:
+    chdir: false
+  output_subdir: null
+  run:
+    dir: .

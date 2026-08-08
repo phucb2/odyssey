@@ -15,6 +15,13 @@ from odyssey.paths import dataset_processed_dir, dataset_raw_dir
 
 MNIST_DIGIT_SIZE = 28
 DEFAULT_DATASET_NAME = "mnist_int"
+DEFAULT_N_SINGLE_PER_DIGIT = 50
+
+
+def parse_image_label(path: Path | str) -> int:
+    """Integer label from PNG stem: ``42.png`` → 42, ``7_3.png`` → 7."""
+    stem = Path(path).stem
+    return int(stem.split("_", 1)[0])
 
 
 @lru_cache(maxsize=1)
@@ -118,13 +125,21 @@ def generate_dataset(
     size: int = 64,
     margin: int = 4,
     seed: int = 0,
+    n_single_per_digit: int = DEFAULT_N_SINGLE_PER_DIGIT,
     output: Path | None = None,
 ) -> Path:
-    """Generate unique (int, image) pairs as PNG files named after each integer."""
+    """Generate int-image PNGs plus optional single-digit oversampling.
+
+    Unique integers in ``0..max_value`` are written as ``{n}.png``. Extra
+    single-digit samples (fresh MNIST glyphs) are written as ``{d}_{i}.png``
+    so the same caption can appear many times.
+    """
     if n_samples <= 0:
         raise ValueError(f"n_samples must be positive, got {n_samples}")
     if max_value < 0:
         raise ValueError(f"max_value must be non-negative, got {max_value}")
+    if n_single_per_digit < 0:
+        raise ValueError(f"n_single_per_digit must be non-negative, got {n_single_per_digit}")
 
     pool_size = max_value + 1
     if n_samples > pool_size:
@@ -146,6 +161,14 @@ def generate_dataset(
         image = number_to_image(label, spacing=spacing, size=size, margin=margin, rng=rng)
         save_image(image, images_dir / f"{label}.png")
 
+    single_digit_files: list[str] = []
+    for digit in range(10):
+        for i in range(n_single_per_digit):
+            image = number_to_image(digit, spacing=spacing, size=size, margin=margin, rng=rng)
+            name = f"{digit}_{i}.png"
+            save_image(image, images_dir / name)
+            single_digit_files.append(name)
+
     manifest = {
         "n_samples": n_samples,
         "max_value": max_value,
@@ -153,7 +176,9 @@ def generate_dataset(
         "size": size,
         "margin": margin,
         "seed": seed,
+        "n_single_per_digit": n_single_per_digit,
         "labels": labels,
+        "single_digit_files": single_digit_files,
     }
     (root / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return root
@@ -166,8 +191,11 @@ def load_dataset(root: Path | str | None = None) -> dict:
     if not images_dir.is_dir():
         raise FileNotFoundError(f"dataset images not found at {images_dir}")
 
-    paths = sorted(images_dir.glob("*.png"), key=lambda p: int(p.stem))
-    labels = [int(p.stem) for p in paths]
+    def sort_key(p: Path) -> tuple[int, str]:
+        return parse_image_label(p), p.stem
+
+    paths = sorted(images_dir.glob("*.png"), key=sort_key)
+    labels = [parse_image_label(p) for p in paths]
     meta_path = root / "manifest.json"
     meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
 
@@ -195,14 +223,26 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MNIST multi-digit image compositor")
     parser.add_argument("--generate", action="store_true", help="generate int-image dataset")
     parser.add_argument("--n-samples", type=int, default=2000)
+    parser.add_argument(
+        "--n-single-per-digit",
+        type=int,
+        default=DEFAULT_N_SINGLE_PER_DIGIT,
+        help="extra single-digit images per digit 0..9 (default: 50 → 500 total)",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--demo-out", type=Path, default=Path("runs/odyssey/mnist_int_demo.png"))
     args = parser.parse_args()
 
     if args.generate:
-        root = generate_dataset(n_samples=args.n_samples, seed=args.seed)
+        root = generate_dataset(
+            n_samples=args.n_samples,
+            seed=args.seed,
+            n_single_per_digit=args.n_single_per_digit,
+        )
         data = load_dataset(root)
+        n_single = sum(1 for lab in data["labels"] if lab < 10)
         print(f"Saved {len(data['labels'])} images to {root / 'images'}")
+        print(f"  single-digit images: {n_single}")
         print(f"  sample: {data['paths'][0].name} -> {data['labels'][0]}")
     else:
         tensor = _demo(args.demo_out)

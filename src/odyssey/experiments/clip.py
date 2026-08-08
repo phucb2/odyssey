@@ -12,6 +12,7 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision.io import read_image
 
+from odyssey.experiments.mnist_int import parse_image_label
 from odyssey.paths import DEFAULT_PROJECT, checkpoint_path, dataset_processed_dir
 from odyssey.training.callback import Callback
 from odyssey.training.callbacks import DeviceCB, TrainCB, default_cbs, make_lr_find
@@ -257,10 +258,13 @@ class ImageTextPairDataset(Dataset):
         self.cfg = cfg
         self.root = pathlib.Path(root) if root is not None else dataset_processed_dir(cfg.data.dataset)
         images_dir = self.root / "images"
-        self.image_paths = sorted(images_dir.glob("*.png"), key=lambda p: int(p.stem))
+        self.image_paths = sorted(
+            images_dir.glob("*.png"),
+            key=lambda p: (parse_image_label(p), p.stem),
+        )
         if not self.image_paths:
             raise FileNotFoundError(f"no PNG images found in {images_dir}")
-        self.texts = [int_to_text(int(p.stem)) for p in self.image_paths]
+        self.texts = [int_to_text(parse_image_label(p)) for p in self.image_paths]
         self.tokenizer = tokenizer or Tokenizer(cfg.tokenizer)
         self.tokenizer.fit(self.texts)
 
@@ -310,7 +314,7 @@ class TextEncoder(nn.Module):
             dim_feedforward=cfg.dim_feedforward,
             dropout=cfg.dropout,
             batch_first=True,
-            activation="gelu",
+            activation="relu",
             norm_first=True,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=cfg.num_layers, enable_nested_tensor=False)
