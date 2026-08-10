@@ -453,11 +453,17 @@ class Qwen3Model(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = self.embed_tokens(input_ids)
+        if inputs_embeds is not None:
+            x = inputs_embeds
+        elif input_ids is not None:
+            x = self.embed_tokens(input_ids)
+        else:
+            raise ValueError("Either input_ids or inputs_embeds must be provided")
         if position_ids is None:
             position_ids = torch.arange(x.shape[1], device=x.device)
             position_ids = position_ids.expand(x.shape[0], -1)
@@ -480,11 +486,17 @@ class Qwen3ForCausalLM(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        hidden = self.model(input_ids, position_ids=position_ids, attention_mask=attention_mask)
+        hidden = self.model(
+            input_ids=input_ids,
+            inputs_embeds=inputs_embeds,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+        )
         return self.lm_head(hidden)
 
     @torch.no_grad()
