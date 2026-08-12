@@ -42,4 +42,6 @@ See [docs/folder-structure.md](docs/folder-structure.md) for `datasets/`, `check
 
 CLIP int-image data: [docs/mnist_int.md](docs/mnist_int.md).
 
+Small math lexical corpus: [docs/small_math_corpus.md](docs/small_math_corpus.md).
+
 Plain / text-only training logs: [docs/plain-console.md](docs/plain-console.md).

@@ -20,6 +20,11 @@ Reference for on-disk layout used by Odyssey training. Paths are resolved from t
 │   └── mnist_int/
 │       ├── raw/          # unused (digits come from datasets/mnist/raw/)
 │       └── processed/    # PNG int-images + manifest.json (CLIP)
+│   └── small/
+│       ├── corpus_train.txt
+│       ├── equations_train.jsonl
+│       ├── equations_holdout.jsonl
+│       └── manifest.json   # English math lexical corpus (char LM)
 ├── checkpoints/
 │   └── odyssey/          # model weights (*.pt, *.pth); project name is configurable
 └── runs/
@@ -46,7 +51,8 @@ Reference for on-disk layout used by Odyssey training. Paths are resolved from t
 - Fashion-MNIST GPU cache: `datasets/fashion-mnist/processed/fashion_mnist.pt`
 - CIFAR-10 auto-downloads to `datasets/cifar10/raw/` on first run (`mltrain model=resnet dataset=cifar10`)
 - coco128 auto-downloads to `datasets/coco128/raw/` on first DETR run (`mltrain task=detr dataset=coco128`)
-- MNIST int-images: generate with `python -m odyssey.experiments.mnist_int --generate` → `datasets/mnist_int/processed/` (see [mnist_int.md](mnist_int.md))
+- MNIST int-images: generate with `python -m odyssey.experiments.mnist_int --generate` → `datasets/mnist-int/processed/` (see [mnist_int.md](mnist_int.md))
+- Small math corpus: generate with `python -m odyssey.experiments.math_corpus --generate` → `datasets/small/` (see [small_math_corpus.md](small_math_corpus.md)); sync with `uv run dvc pull datasets/small.dvc`
 - Gradient accumulation: see [gradient-accumulation.md](gradient-accumulation.md) (`grad_accum=4` via Hydra)
 
 ## Git
