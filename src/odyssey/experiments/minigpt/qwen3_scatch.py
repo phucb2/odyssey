@@ -507,6 +507,8 @@ class Qwen3ForCausalLM(nn.Module):
         max_new_tokens: int = 64,
         temperature: float = 1.0,
         top_k: int | None = 40,
+        eos_token_id: int | None = None,
+        greedy: bool = False,
     ) -> torch.Tensor:
         """Greedy / multinomial generate from a prompt batch of shape (B, T)."""
         self.eval()
@@ -514,19 +516,56 @@ class Qwen3ForCausalLM(nn.Module):
         block = self.cfg.max_position_embeddings
         for _ in range(max_new_tokens):
             ctx = ids[:, -block:]
-            logits = self(ctx)[:, -1, :] / max(temperature, 1e-8)
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
-            probs = F.softmax(logits, dim=-1)
-            next_id = torch.multinomial(probs, num_samples=1)
+            logits = self(ctx)[:, -1, :]
+            if greedy or temperature <= 0:
+                next_id = logits.argmax(dim=-1, keepdim=True)
+            else:
+                logits = logits / max(temperature, 1e-8)
+                if top_k is not None:
+                    v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
+                probs = F.softmax(logits, dim=-1)
+                next_id = torch.multinomial(probs, num_samples=1)
             ids = torch.cat([ids, next_id], dim=1)
+            if eos_token_id is not None and (next_id == eos_token_id).all():
+                break
         return ids
 
 
-def causal_lm_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+def causal_lm_loss(logits: torch.Tensor, targets: torch.Tensor, *, ignore_index: int = -100) -> torch.Tensor:
     """Token-level cross-entropy over a (B, T, V) logit tensor."""
-    return F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+    return F.cross_entropy(
+        logits.reshape(-1, logits.size(-1)),
+        targets.reshape(-1),
+        ignore_index=ignore_index,
+    )
+
+
+def load_qwen3_checkpoint(
+    path: str | pathlib.Path,
+    *,
+    map_location: str | torch.device = "cpu",
+) -> tuple[Qwen3ForCausalLM, Tokenizer, Qwen3LMConfig, dict]:
+    """Restore Qwen3 char LM + tokenizer from ``save_qwen3_checkpoint`` output."""
+    payload = torch.load(path, map_location=map_location, weights_only=False)
+    cfg = OmegaConf.to_object(
+        OmegaConf.merge(OmegaConf.structured(Qwen3LMConfig), OmegaConf.create(payload["cfg"]))
+    )
+    tok_state = payload["tokenizer"]
+    tokenizer = Tokenizer(cfg.tokenizer)
+    tokenizer.stoi = dict(tok_state["stoi"])
+    tokenizer.itos = {int(k): v for k, v in tok_state["itos"].items()}
+    tokenizer.pad = int(tok_state["pad"])
+    tokenizer.bos = int(tok_state["bos"])
+    tokenizer.eos = int(tok_state["eos"])
+
+    model_cfg_dict = payload.get("model_cfg") or payload["cfg"].get("model", {})
+    model_cfg = OmegaConf.to_object(
+        OmegaConf.merge(OmegaConf.structured(Qwen3ScratchConfig), OmegaConf.create(model_cfg_dict))
+    )
+    model = Qwen3ForCausalLM(model_cfg)
+    model.load_state_dict(payload["model"])
+    return model, tokenizer, cfg, payload
 
 
 # ---------------------------------------------------------------------------

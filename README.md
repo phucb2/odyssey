@@ -41,3 +41,5 @@ docs/          # project documentation
 See [docs/folder-structure.md](docs/folder-structure.md) for `datasets/`, `checkpoints/`, and `runs/` layout.
 
 CLIP int-image data: [docs/mnist_int.md](docs/mnist_int.md).
+
+Plain / text-only training logs: [docs/plain-console.md](docs/plain-console.md).

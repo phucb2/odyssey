@@ -18,11 +18,11 @@ from odyssey.tracking.ui import (
     console,
     describe_group_depth,
     describe_max_layers,
+    is_plain,
     safe_plt_show,
     top_params,
 )
 
-_console = console()
 _TOP_PARAMS = top_params()
 _DESCRIBE_MAX_LAYERS = describe_max_layers()
 _DESCRIBE_GROUP_DEPTH = describe_group_depth()
@@ -299,10 +299,12 @@ def _macs_by_module(m, x):
     for h in hs: h.remove()
     return stats
 
-def describe_model(m, inp_size=None, ex_inp=None, bs=1, device='cpu', title=None):
+def describe_model(m, inp_size=None, ex_inp=None, bs=1, device=None, title=None):
     "Summary of `m`: params, memory, layers, and optional MAC/FLOP estimate (thop)."
-    m = m.to(device)
     p = next(m.parameters(), None)
+    if device is None:
+        device = str(p.device) if p is not None else "cpu"
+    m = m.to(device)
     dev,dtype = (str(p.device), str(p.dtype).replace('torch.','')) if p is not None else (device, 'float32')
     inp_size = inp_size or _entry_inp_size(m)
     x = _example_x(m, inp_size, ex_inp, bs, p.device if p is not None else device)
@@ -321,82 +323,122 @@ def describe_model(m, inp_size=None, ex_inp=None, bs=1, device='cpu', title=None
             trn_ps += param.numel()
 
     macs, err = _thop_macs(m, x) if x is not None else (None, None)
+    c = console()
+    plain = is_plain()
 
-    with _console.capture() as cap:
+    with c.capture() as cap:
         hdr = title or type(m).__name__
-        meta = Text.assemble(
-            ("params ", "dim"), (f"{ps:,}", "bold cyan"), (" · mem ", "dim"), (_mem(pmem + bmem), "bold yellow"),
-        )
-        if x is not None:
-            meta.append_text(Text.assemble((" · in ", "dim"), (str(tuple(x.shape)), "white")))
-        meta.append_text(Text.assemble((" · ", "dim"), (dev, "dim"), (" ", ""), (dtype, "dim")))
-        _console.print(Panel(meta, title=f"[bold cyan]{hdr}[/bold cyan]", border_style="cyan", padding=(0, 1)))
+        if plain:
+            meta_bits = [f"params {ps:,}", f"mem {_mem(pmem + bmem)}"]
+            if x is not None:
+                meta_bits.append(f"in {tuple(x.shape)}")
+            meta_bits.append(f"{dev} {dtype}")
+            c.print(f"=== {hdr} ===")
+            c.print(" · ".join(meta_bits))
+        else:
+            meta = Text.assemble(
+                ("params ", "dim"), (f"{ps:,}", "bold cyan"), (" · mem ", "dim"), (_mem(pmem + bmem), "bold yellow"),
+            )
+            if x is not None:
+                meta.append_text(Text.assemble((" · in ", "dim"), (str(tuple(x.shape)), "white")))
+            meta.append_text(Text.assemble((" · ", "dim"), (dev, "dim"), (" ", ""), (dtype, "dim")))
+            c.print(Panel(meta, title=f"[bold cyan]{hdr}[/bold cyan]", border_style="cyan", padding=(0, 1)))
 
         if mod_macs:
             layer_rows, group_depth = _pick_layer_rows(m, mod_macs)
-            lt = Table(
-                title=f"FLOPs by layer (group depth {group_depth})",
-                box=SIMPLE_HEAVY,
-                header_style="bold cyan",
-                show_lines=False,
-                padding=(0, 1),
-                show_edge=False,
-                expand=False,
-            )
-            lt.add_column("Layer", style="bold", no_wrap=False, max_width=28)
-            lt.add_column("Params", justify="right")
-            lt.add_column("FLOPs", justify="right", style="magenta")
-            lt.add_column("%FLOPs", justify="right", style="dim")
-            lt.add_column("%Params", justify="right", style="dim")
-            lt.add_column("Tr", justify="center")
-            for gname, st in layer_rows:
-                flops = 2 * st["macs"]
-                pct_f = 100 * st["macs"] / total_macs if total_macs else 0
-                pct_p = 100 * st["params"] / ps if ps else 0
-                row_style = "bold yellow" if pct_f >= 15 else None
-                lt.add_row(
-                    Text(gname, style=row_style),
-                    Text(f"{st['params']:,}", style=row_style),
-                    Text(_ops_fmt(flops, "FLOP"), style=row_style or "magenta"),
-                    _pct(st["macs"], total_macs),
-                    _pct(st["params"], ps),
-                    Text("Y", style="green") if st["trainable"] else Text("-", style="dim"),
+            if plain:
+                c.print(f"FLOPs by layer (group depth {group_depth})")
+                c.print(f"{'Layer':<28} {'Params':>12} {'FLOPs':>12} {'%FLOPs':>8} {'%Params':>8} Tr")
+                for gname, st in layer_rows:
+                    flops = 2 * st["macs"]
+                    pct_f = 100 * st["macs"] / total_macs if total_macs else 0
+                    pct_p = 100 * st["params"] / ps if ps else 0
+                    tr = "Y" if st["trainable"] else "-"
+                    c.print(
+                        f"{gname:<28} {st['params']:>12,} {_ops_fmt(flops, 'FLOP'):>12} "
+                        f"{pct_f:7.1f}% {pct_p:7.1f}% {tr}"
+                    )
+            else:
+                lt = Table(
+                    title=f"FLOPs by layer (group depth {group_depth})",
+                    box=SIMPLE_HEAVY,
+                    header_style="bold cyan",
+                    show_lines=False,
+                    padding=(0, 1),
+                    show_edge=False,
+                    expand=False,
                 )
-            _console.print(lt)
+                lt.add_column("Layer", style="bold", no_wrap=False, max_width=28)
+                lt.add_column("Params", justify="right")
+                lt.add_column("FLOPs", justify="right", style="magenta")
+                lt.add_column("%FLOPs", justify="right", style="dim")
+                lt.add_column("%Params", justify="right", style="dim")
+                lt.add_column("Tr", justify="center")
+                for gname, st in layer_rows:
+                    flops = 2 * st["macs"]
+                    pct_f = 100 * st["macs"] / total_macs if total_macs else 0
+                    pct_p = 100 * st["params"] / ps if ps else 0
+                    row_style = "bold yellow" if pct_f >= 15 else None
+                    lt.add_row(
+                        Text(gname, style=row_style),
+                        Text(f"{st['params']:,}", style=row_style),
+                        Text(_ops_fmt(flops, "FLOP"), style=row_style or "magenta"),
+                        _pct(st["macs"], total_macs),
+                        _pct(st["params"], ps),
+                        Text("Y", style="green") if st["trainable"] else Text("-", style="dim"),
+                    )
+                c.print(lt)
 
-        stats = Text.assemble(
-            ("trainable ", "dim"), (f"{trn_ps:,}", "green"), (" / ", "dim"), (f"{ps:,}", "cyan"),
-            (" · buf ", "dim"), (f"{bufs:,}", "dim"), (f" ({_mem(bmem)})", "dim"),
-        )
-        if err:
-            stats.append_text(Text.assemble((" · ", "dim"), ("profile skipped", "dim red")))
-        elif macs is not None:
-            stats.append_text(Text.assemble(
-                (" · MACs ", "dim"), (_ops_fmt(macs, "MAC"), "bold magenta"),
-                (" · FLOPs ", "dim"), (_ops_fmt(2 * macs, "FLOP"), "magenta"),
-            ))
-        elif total_macs:
-            stats.append_text(Text.assemble(
-                (" · MACs ", "dim"), (_ops_fmt(total_macs, "MAC"), "bold magenta"),
-                (" · FLOPs ", "dim"), (_ops_fmt(total_flops, "FLOP"), "magenta"),
-            ))
-        _console.print(stats)
+        if plain:
+            stats = f"trainable {trn_ps:,} / {ps:,} · buf {bufs:,} ({_mem(bmem)})"
+            if err:
+                stats += " · profile skipped"
+            elif macs is not None:
+                stats += f" · MACs {_ops_fmt(macs, 'MAC')} · FLOPs {_ops_fmt(2 * macs, 'FLOP')}"
+            elif total_macs:
+                stats += f" · MACs {_ops_fmt(total_macs, 'MAC')} · FLOPs {_ops_fmt(total_flops, 'FLOP')}"
+            c.print(stats)
+        else:
+            stats = Text.assemble(
+                ("trainable ", "dim"), (f"{trn_ps:,}", "green"), (" / ", "dim"), (f"{ps:,}", "cyan"),
+                (" · buf ", "dim"), (f"{bufs:,}", "dim"), (f" ({_mem(bmem)})", "dim"),
+            )
+            if err:
+                stats.append_text(Text.assemble((" · ", "dim"), ("profile skipped", "dim red")))
+            elif macs is not None:
+                stats.append_text(Text.assemble(
+                    (" · MACs ", "dim"), (_ops_fmt(macs, "MAC"), "bold magenta"),
+                    (" · FLOPs ", "dim"), (_ops_fmt(2 * macs, "FLOP"), "magenta"),
+                ))
+            elif total_macs:
+                stats.append_text(Text.assemble(
+                    (" · MACs ", "dim"), (_ops_fmt(total_macs, "MAC"), "bold magenta"),
+                    (" · FLOPs ", "dim"), (_ops_fmt(total_flops, "FLOP"), "magenta"),
+                ))
+            c.print(stats)
 
         tensors = sorted(m.named_parameters(), key=lambda t: t[1].numel(), reverse=True)[:_TOP_PARAMS]
-        if len(tensors) < sum(1 for _ in m.named_parameters()):
-            n_more = sum(1 for _ in m.named_parameters()) - len(tensors)
+        n_all = sum(1 for _ in m.named_parameters())
+        if len(tensors) < n_all:
+            n_more = n_all - len(tensors)
             pt_title = f"Top {_TOP_PARAMS} params (+{n_more} more)"
         else:
             pt_title = "Params"
-        pt = Table(title=pt_title, box=SIMPLE_HEAVY, header_style="bold cyan",
-                   padding=(0, 1), show_edge=False, expand=False)
-        pt.add_column("Name")
-        pt.add_column("Shape", style="dim")
-        pt.add_column("#", justify="right")
-        pt.add_column("Mem", justify="right", style="yellow")
-        for nm,o in tensors:
-            n = o.numel()
-            pt.add_row(nm, str(tuple(o.shape)), f"{n:,}", _mem(n*o.element_size()))
-        _console.print(pt)
+        if plain:
+            c.print(pt_title)
+            for nm, o in tensors:
+                n = o.numel()
+                c.print(f"  {nm}  {tuple(o.shape)}  {n:,}  {_mem(n * o.element_size())}")
+        else:
+            pt = Table(title=pt_title, box=SIMPLE_HEAVY, header_style="bold cyan",
+                       padding=(0, 1), show_edge=False, expand=False)
+            pt.add_column("Name")
+            pt.add_column("Shape", style="dim")
+            pt.add_column("#", justify="right")
+            pt.add_column("Mem", justify="right", style="yellow")
+            for nm,o in tensors:
+                n = o.numel()
+                pt.add_row(nm, str(tuple(o.shape)), f"{n:,}", _mem(n*o.element_size()))
+            c.print(pt)
 
     return PrettyString(cap.get())

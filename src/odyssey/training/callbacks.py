@@ -1,5 +1,6 @@
 """Training callbacks."""
 import collections
+import contextlib
 import math
 import time
 import warnings
@@ -29,6 +30,7 @@ from odyssey.training.callback import (
     to_device,
 )
 from odyssey.training.cuda import torch_compile_available
+from odyssey.training.schedule import SchedulerCB
 from odyssey.tracking.diagnostics import (
     _activation_hook_layers,
     _activation_log1p_abs_stats,
@@ -39,21 +41,23 @@ from odyssey.models import ResBlock
 from odyssey.paths import DEFAULT_PROJECT, run_path
 from odyssey.tracking.ui import (
     NotebookDisplay,
+    _PlainProgress,
     _compact_metric_line,
     _dict_metrics_table,
     _format_batch_time,
+    _format_plain_metrics_table,
     _loss_sparklines,
     _metrics_table,
     _styled_metric,
     _train_progress,
     console,
     in_notebook,
+    is_plain,
     metric_history,
     notebook_min_refresh,
     safe_plt_show,
 )
 
-_console = console()
 _METRIC_HISTORY = metric_history()
 
 class MetricsCB(Callback):
@@ -91,7 +95,7 @@ class MetricsCB(Callback):
             metric_y = metric_y.argmax(dim=-1)
         for m in self.metrics.values(): m.update(to_cpu(learn.preds), to_cpu(metric_y))
     def _log(self, log):
-        _console.print(_dict_metrics_table(log))
+        console().print(_dict_metrics_table(log))
 
 
 class LossDictMetricsCB(Callback):
@@ -193,9 +197,25 @@ class CompileWarmupCB(Callback):
         saved = {k: v.detach().clone() for k, v in learn.model.state_dict().items()}
         batch = _prepare_learn_batch(learn, next(iter(learn.dls.train)))
 
-        for _ in range(self.n_batches):
-            learn.batch = batch
-            learn.one_batch()
+        # one_batch() skips before_batch hooks (AMP autocast). Wrap here when fp16 data + AMP.
+        # Detach LR schedulers so warmup opt steps do not consume OneCycle / cosine budgets.
+        use_amp = getattr(learn, '_use_amp', False)
+        amp_ctx = (
+            torch.autocast("cuda", dtype=torch.float16)
+            if use_amp
+            else contextlib.nullcontext()
+        )
+        held_sched = [cb for cb in learn.cbs if isinstance(cb, SchedulerCB)]
+        if held_sched:
+            learn.cbs = [cb for cb in learn.cbs if not isinstance(cb, SchedulerCB)]
+        try:
+            with amp_ctx:
+                for _ in range(self.n_batches):
+                    learn.batch = batch
+                    learn.one_batch()
+        finally:
+            if held_sched:
+                learn.cbs = list(learn.cbs) + held_sched
 
         learn.model.load_state_dict(saved)
         learn.model.train(was_training)
@@ -294,7 +314,8 @@ class MixPrecisionCB(Callback):
             self.scaler = torch.amp.GradScaler("cuda", enabled=True)
 
     def before_batch(self, learn):
-        if self._enabled and learn.model.training:
+        # Autocast on train and eval: GPU data is often cached as fp16 while weights stay fp32.
+        if self._enabled:
             self._autocast = torch.autocast("cuda", dtype=torch.float16)
             self._autocast.__enter__()
         else:
@@ -368,8 +389,9 @@ class GradAccumCB(Callback):
 
 class ProgressCB(Callback):
     order = MetricsCB.order+1
-    def __init__(self, plot=False, min_refresh_interval=None):
+    def __init__(self, plot=False, min_refresh_interval=None, plain=None):
         self.plot = plot
+        self.plain = is_plain() if plain is None else bool(plain)
         # Colab/Jupyter: slower refresh so the single display handle stays cheap.
         if min_refresh_interval is None:
             min_refresh_interval = notebook_min_refresh() if in_notebook() else 0.25
@@ -378,14 +400,14 @@ class ProgressCB(Callback):
     def before_fit(self, learn):
         self.learn = learn
         self.n_epochs = len(learn.epochs) if hasattr(learn.epochs, '__len__') else None
-        self.console = _console
-        self.progress = _train_progress()
+        self.console = console()
+        self.progress = _train_progress(plain=self.plain)
         self.epoch_task = self.progress.add_task("epochs", total=self.n_epochs)
         self.batch_task = None
         self.metrics_table = None
         self.columns = None
         self.metric_rows = []
-        self.summary = Text("")
+        self.summary = "" if self.plain else Text("")
         self.latest_is_best = False
         self.first = True
         self.losses, self.val_losses = [], []
@@ -395,7 +417,9 @@ class ProgressCB(Callback):
         self._notebook = in_notebook()
         self.live = None
         self._nb_display = None
-        if self._notebook:
+        if self.plain:
+            pass  # text-only: print on refresh, no Live / NotebookDisplay
+        elif self._notebook:
             # DisplayHandle updates one output in place — Rich Live appends in Colab.
             self._nb_display = NotebookDisplay()
             self._nb_display.update(self._group())
@@ -406,21 +430,44 @@ class ProgressCB(Callback):
                 vertical_overflow="visible",
             )
             self.live.start()
-        if hasattr(learn, 'metrics'): learn.metrics._log = self._log
+        if getattr(learn, 'metrics', None) is not None:
+            learn.metrics._log = self._log
 
     def _group(self):
         items = [self.progress, Panel(self.summary, border_style="green" if self.latest_is_best else "cyan", padding=(0, 1))]
         if self.metrics_table is not None: items.append(self.metrics_table)
-        if self.plot: items.append(_loss_sparklines(self.losses, self.val_losses))
+        if self.plot: items.append(_loss_sparklines(self.losses, self.val_losses, plain=False))
         return Group(*items)
+
+    def _plain_block(self, *, full=True) -> str:
+        lines = []
+        if isinstance(self.progress, _PlainProgress):
+            status = self.progress.status_line()
+            if status:
+                lines.append(status)
+        if not full:
+            return "\n".join(lines)
+        if self.summary:
+            lines.append(str(self.summary))
+        if self.metrics_table is not None:
+            lines.append(_format_plain_metrics_table(self.metrics_table))
+        if self.plot:
+            lines.append(_loss_sparklines(self.losses, self.val_losses, plain=True))
+        return "\n".join(lines)
 
     def _rebuild_metrics_table(self):
         if not self.columns: return
-        self.metrics_table = _metrics_table(self.columns)
+        self.metrics_table = _metrics_table(self.columns, plain=self.plain)
         for i, d in enumerate(self.metric_rows):
             is_best = i == len(self.metric_rows) - 1 and float(d.get('val_loss', math.inf)) <= self.best_val_loss
-            cells = [_styled_metric(k, d[k], best=is_best and k == 'val_loss') for k in self.columns]
-            self.metrics_table.add_row(*cells)
+            cells = [
+                _styled_metric(k, d[k], best=is_best and k == 'val_loss', plain=self.plain)
+                for k in self.columns
+            ]
+            if self.plain:
+                self.metrics_table["rows"].append(cells)
+            else:
+                self.metrics_table.add_row(*cells)
 
     def _should_refresh(self, *, force=False):
         if force: return True
@@ -434,6 +481,11 @@ class ProgressCB(Callback):
             return
         self._last_refresh = now
         self._pending_refresh = False
+        if self.plain:
+            block = self._plain_block(full=force)
+            if block:
+                self.console.print(block)
+            return
         renderable = self._group()
         if self._nb_display is not None:
             self._nb_display.update(renderable)
@@ -442,6 +494,9 @@ class ProgressCB(Callback):
 
     def _stop_live(self):
         if self._pending_refresh: self._refresh(force=True)
+        if self.plain:
+            self.progress = None
+            return
         if self._nb_display is not None:
             # Leave the last display_id frame visible; do not reprint.
             self._nb_display.close()
@@ -483,7 +538,7 @@ class ProgressCB(Callback):
         self.metric_rows.append(d)
         if len(self.metric_rows) > _METRIC_HISTORY:
             self.metric_rows = self.metric_rows[-_METRIC_HISTORY:]
-        self.summary = _compact_metric_line(d, n_epochs=self.n_epochs, best=is_best)
+        self.summary = _compact_metric_line(d, n_epochs=self.n_epochs, best=is_best, plain=self.plain)
         self._rebuild_metrics_table()
         self._refresh(force=True)
 
@@ -597,7 +652,7 @@ class LRFinder(Callback):
         self.stop_div_factor = stop_div_factor
         
     def before_fit(self, learn):
-        _console.print("[dim]LRFinder: scanning learning rates…[/dim]")
+        console().print("[dim]LRFinder: scanning learning rates…[/dim]")
         self.lrs,self.losses = [],[]
         self.min = math.inf
         
@@ -608,7 +663,7 @@ class LRFinder(Callback):
         self.losses.append(loss)
         if loss < self.min: self.min = loss
         if loss > self.min * self.stop_div_factor:
-            _console.print(f"[yellow]LRFinder: loss > {self.stop_div_factor:.0f}× min — stopping[/yellow]")
+            console().print(f"[yellow]LRFinder: loss > {self.stop_div_factor:.0f}× min — stopping[/yellow]")
             raise CancelFitException()
         for g in learn.opt.param_groups: g['lr'] *= self.lr_mult
 
@@ -656,7 +711,7 @@ def plot_lr_find(lrs, losses, suggestions=None, names=None, *, title="Learning r
     if save_path:
         Path(save_path).parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(save_path, dpi=120, bbox_inches="tight")
-        _console.print(f"[green]LR finder plot saved → {save_path}[/green]")
+        console().print(f"[green]LR finder plot saved → {save_path}[/green]")
     _safe_plt_show(fig, show)
     return fig
 
@@ -668,7 +723,7 @@ def _report_lr_suggestions(suggested, names):
         summary.append_text(Text.assemble(
             (f"{nm} ", "dim"), (f"{getattr(suggested, nm):.2e}", styles.get(nm, "white")),
         ))
-    _console.print(Panel(summary, title="[bold]Suggested learning rates[/bold]", border_style="green"))
+    console().print(Panel(summary, title="[bold]Suggested learning rates[/bold]", border_style="green"))
 
 class LRFind:
     "Standalone LR sweep; compose with Learner via `lr_find=` or call `run(learn)` / `lr_find(learn)`."
