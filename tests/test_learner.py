@@ -16,6 +16,7 @@ from odyssey.training import (
     default_cbs,
     make_lr_find,
 )
+from odyssey.training.callback import to_device
 from odyssey.training.config import AnalysisConfig
 
 
@@ -110,6 +111,61 @@ def test_auto_train_false_raises():
         )
 
 
+def test_metrics_cb_integer_column_labels():
+    from torcheval.metrics import MulticlassAccuracy
+
+    class _Learn:
+        training = False
+
+    learn = _Learn()
+    learn.model = nn.Linear(1, 1)
+    learn.model.training = False
+    learn.preds = torch.tensor([[4.0, 0.0, 0.0], [0.0, 4.0, 0.0]])
+    learn.batch = (torch.zeros(2, 1), torch.tensor([[0], [1]]))
+    learn.loss = torch.tensor(0.2)
+    cb = MetricsCB(accuracy=MulticlassAccuracy(num_classes=3))
+    cb.before_epoch(learn)
+    cb.after_batch(learn)
+    assert float(cb.metrics["accuracy"].compute()) == 1.0
+
+
+def test_metrics_cb_one_hot_labels():
+    from torcheval.metrics import MulticlassAccuracy
+
+    class _Learn:
+        training = False
+
+    learn = _Learn()
+    learn.model = nn.Linear(1, 1)
+    learn.model.training = False
+    learn.preds = torch.tensor([[4.0, 0.0, 0.0], [0.0, 4.0, 0.0]])
+    learn.batch = (torch.zeros(2, 1), torch.tensor([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]))
+    learn.loss = torch.tensor(0.2)
+    cb = MetricsCB(accuracy=MulticlassAccuracy(num_classes=3))
+    cb.before_epoch(learn)
+    cb.after_batch(learn)
+    assert float(cb.metrics["accuracy"].compute()) == 1.0
+
+
+class _BNModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(3)
+        self.fc = nn.Linear(3 * 8 * 8, 2)
+
+    def forward(self, x):
+        return self.fc(self.bn(x).flatten(1))
+
+
+def test_learner_toggles_eval_on_children():
+    model = _BNModel()
+    learn = _cpu_learner(model=model)
+    assert model.bn.training
+    learn.validate()
+    assert not model.training
+    assert not model.bn.training
+
+
 def test_learner_fit_updates_weights():
     model = _TinyModel()
     before = model.fc.weight.detach().clone()
@@ -135,6 +191,40 @@ def test_pin_memory_and_project_name():
     )
     assert learn.pin_memory is True
     assert learn.project_name == "test-project"
+
+
+def test_to_device_none_non_blocking():
+    t = torch.zeros(2)
+    out = to_device(t, torch.device("cpu"), None)
+    assert torch.equal(out, t)
+
+
+def test_device_cb_pin_memory_none_non_blocking_is_bool():
+    learn = _cpu_learner()
+    assert learn.pin_memory is None
+    DeviceCB(device=torch.device("cpu")).before_fit(learn)
+    assert learn.non_blocking is False
+    assert learn.pin_memory is False
+
+
+class _NoMoveModel(_TinyModel):
+    def to(self, *args, **kwargs):
+        return self
+
+
+def test_device_cb_cuda_pin_memory_none_is_false():
+    "Colab GPU: `True and None` must not reach Tensor.to(non_blocking=None)."
+    learn = Learner(
+        _NoMoveModel(),
+        _TinyDls(),
+        nn.CrossEntropyLoss(),
+        torch.optim.SGD,
+        pin_memory=None,
+        cbs=[TrainCB()],
+        scheduler="none",
+    )
+    DeviceCB(device=torch.device("cuda")).before_fit(learn)
+    assert learn.non_blocking is False
 
 
 def test_make_lr_find_from_analysis():

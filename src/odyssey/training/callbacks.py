@@ -92,7 +92,8 @@ class MetricsCB(Callback):
             return
         metric_y = getattr(learn, 'batch_labels', learn.batch[1])
         if isinstance(metric_y, torch.Tensor) and metric_y.ndim > 1:
-            metric_y = metric_y.argmax(dim=-1)
+            # [B, 1] class ids (MedMNIST) are not one-hot; argmax would always be 0.
+            metric_y = metric_y.squeeze(-1) if metric_y.shape[-1] == 1 else metric_y.argmax(dim=-1)
         for m in self.metrics.values(): m.update(to_cpu(learn.preds), to_cpu(metric_y))
     def _log(self, log):
         console().print(_dict_metrics_table(log))
@@ -135,15 +136,15 @@ class DeviceCB(Callback):
     def before_fit(self, learn): 
         learn.device = self.device
         if hasattr(learn.model, 'to'): learn.model.to(self.device)
-        learn.pin_memory = getattr(learn, 'pin_memory', False)
-        learn.non_blocking = (
+        learn.pin_memory = bool(getattr(learn, 'pin_memory', False))
+        learn.non_blocking = bool(
             getattr(learn.device, 'type', None) == 'cuda' and learn.pin_memory
         )
     def before_batch(self, learn):
         x = learn.batch[0]
         if isinstance(x, torch.Tensor) and x.device == self.device:
             return
-        learn.batch = to_device(learn.batch, self.device, learn.non_blocking)
+        learn.batch = to_device(learn.batch, self.device, bool(getattr(learn, "non_blocking", False)))
 
 class CompileCB(Callback):
     "Wrap model with torch.compile before fit (CUDA + Triton only)."
@@ -170,7 +171,7 @@ def _is_compiled_model(model):
 
 
 def _prepare_learn_batch(learn, batch):
-    batch = to_device(batch, learn.device, learn.non_blocking)
+    batch = to_device(batch, learn.device, bool(getattr(learn, "non_blocking", False)))
     if getattr(learn, 'use_channels_last', False):
         x, *rest = batch
         if isinstance(x, torch.Tensor):

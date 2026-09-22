@@ -26,6 +26,7 @@ def to_cpu(x):
     return res.float() if res.dtype==torch.float16 else res
 
 def to_device(b, device, non_blocking=False):
+    non_blocking = bool(non_blocking)
     if isinstance(b, tuple): return tuple(to_device(o, device, non_blocking) for o in b)
     if isinstance(b, list): return [to_device(o, device, non_blocking) for o in b]
     if isinstance(b, dict): return {k:to_device(v, device, non_blocking) for k,v in b.items()}

@@ -26,11 +26,14 @@ dependencies = [
     "traitlets>=5.14.0",
     "ipywidgets>=8.1.0",
     "accelerate>=1.14.0",
+    "medmnist>=3.0.2",
+    "einops>=0.8.2",
 ]
 
 [project.scripts]
 odyssey = "odyssey.__main__:main"
 mltrain = "odyssey.mltrain:main"
+kva = "odyssey.kva:main"
 
 [build-system]
 requires = ["hatchling"]

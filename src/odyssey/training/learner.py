@@ -75,7 +75,7 @@ class Learner:
             pass
 
     def one_epoch(self, train):
-        self.model.training = train
+        self.model.train(train)
         self.dl = self.dls.train if train else self.dls.valid
         with self.cb_ctx("epoch", CancelEpochException):
             for self.num, self.batch in enumerate(self.dl):

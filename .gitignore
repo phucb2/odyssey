@@ -19,6 +19,9 @@ runs/
 outputs/
 data_*.pt
 
+# Colab CLI notebook execution output
+notebooks/*_output.ipynb
+
 # Test / tooling
 .pytest_cache/
 .coverage

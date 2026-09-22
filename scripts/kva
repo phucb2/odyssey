@@ -1,0 +1,974 @@
+#!/usr/bin/env bash
+# kva — Vast.ai exec CLI (colab exec analogue).
+# Usage:
+#   kva use-context INSTANCE_ID
+#   kva sessions
+#   kva exec -f script.py
+#   kva upload LOCAL [REMOTE]
+#   kva download REMOTE [LOCAL]
+#   kva ssh [--port 8080]
+#   kva stop [--yes]
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+REMOTE_DIR=${KVA_REMOTE_DIR:-/workspace/odyssey}
+PYTHON_BIN=${KVA_PYTHON:-python3}
+SSH_IDENTITY=${KVA_SSH_IDENTITY:-$HOME/.ssh/id_ed25519}
+# KVA_VERBOSE=1 (or KVA_LOG=all) prints ssh/rsync details and remote MOTD.
+KVA_VERBOSE=${KVA_VERBOSE:-0}
+KVA_LOG=${KVA_LOG:-}
+
+usage() {
+  cat <<'EOF'
+kva — Vast.ai analogue of `colab exec -s ... -f ...`
+
+Usage:
+  kva new [--size small|medium|large] [--gpu RTX_3060] [--max-dph 0.1] [--disk 20] [--yes]
+  kva use-context INSTANCE_ID
+  kva current-context
+  kva sessions
+  kva exec [-s INSTANCE_ID] -f SCRIPT.py [--setup] [--detach] [--no-sync] [-- args...]
+  kva upload [-s INSTANCE_ID] LOCAL [REMOTE]
+  kva download [-s INSTANCE_ID] REMOTE [LOCAL]
+  kva ssh [-s INSTANCE_ID] [--port 8080]
+  kva stop [-s INSTANCE_ID] [--yes]
+
+kva new:
+  --size SIZE        GPU tier: small (default, RTX_3060), medium (20GB+), large (40GB+)
+  --gpu NAME         exact GPU name (overrides --size VRAM floor)
+  --max-dph USD      max GPU $/hour (default: small 0.1, medium 0.5, large 2.5)
+  --disk GB          disk size (default: 20)
+  --max-disk-day USD max disk $/day (default: 2 for 20GB; 0 disables)
+  --label NAME       instance label (default: odyssey)
+  --yes, -y          skip the price prompt (required if stdin is not a TTY)
+  --dry-run          print the search query and exit
+
+kva sessions:
+  list all Vast.ai instances (id, status, gpu, price). * is current-context.
+
+kva exec:
+  -s, --session ID   Vast.ai instance ID (overrides current-context / $VAST_INSTANCE_ID)
+  -f, --file PATH    Local script to run on the host (repo-relative)
+  --setup            pip install -e . on the host after sync
+  --detach           nohup the job; print log paths and exit
+  --no-sync          skip rsync (source already on the host)
+  -h, --help         show this help
+
+kva upload / download:
+  -s, --session ID   Vast.ai instance ID (overrides current-context / $VAST_INSTANCE_ID)
+  LOCAL              local file or directory
+  REMOTE             remote path (default upload dest: /workspace/)
+  --dry-run          print the rsync command and exit
+  -h, --help         show this help
+
+  rsync -avz --progress over SSH (not vastai copy). exec skips datasets/.
+  Relative REMOTE is under /workspace. Never / or /root.
+
+  kva upload ./datasets/coco128/raw/coco128.zip
+  kva download /workspace/coco128.zip ./
+
+kva ssh:
+  -s, --session ID   Vast.ai instance ID (overrides current-context / $VAST_INSTANCE_ID)
+  --port N           local and remote port for -L (default: 8080)
+  -L SPEC            full forward spec (overrides --port)
+  --dry-run          print the ssh command and exit
+  -h, --help         show this help
+
+  Interactive shell with -L 8080:localhost:8080 (http://127.0.0.1:8080).
+  Human-only; agents should not run this (needs a TTY). Extra args after --.
+  Unknown TERM values (Ghostty, Kitty, ...) are sent as xterm-256color.
+
+  kva ssh
+  kva ssh --port 8888
+  kva ssh -s ID
+
+kva use-context:
+  INSTANCE_ID        set default instance (like kubectl config use-context)
+  --unset            clear current-context
+
+  kva use-context ID
+  kva current-context
+
+kva stop:
+  -s, --session ID   Vast.ai instance ID (overrides current-context / $VAST_INSTANCE_ID)
+  --yes, -y          skip the destroy prompt (required if stdin is not a TTY)
+
+  Destroys the instance (GPU + disk billing stop). vastai stop only pauses GPU.
+
+SSH always uses -i ~/.ssh/id_ed25519 (override with \$KVA_SSH_IDENTITY).
+Direct public_ip:direct_port_end is preferred over the proxy ssh-url.
+
+Env:
+  KVA_VERBOSE=1    show ssh/rsync lines and remote MOTD (also KVA_LOG=all)
+  KVA_CONFIG       context file (default ~/.config/kva/config)
+  VAST_INSTANCE_ID override current-context (still loses to -s)
+
+Logs:
+  local  runs/kva/<timestamp>_<stem>.log
+  remote /workspace/odyssey/runs/kva/<timestamp>_<stem>.log
+EOF
+}
+
+kva_verbose() {
+  case "${KVA_VERBOSE}" in
+    1|true|TRUE|yes|YES|all) return 0 ;;
+  esac
+  case "${KVA_LOG}" in
+    all|verbose|debug) return 0 ;;
+  esac
+  return 1
+}
+
+kva_log() {
+  kva_verbose || return 0
+  printf 'kva: %s\n' "$*"
+}
+
+die() {
+  printf 'kva: %s\n' "$*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing command: $1"
+}
+
+context_file() {
+  if [[ -n "${KVA_CONFIG:-}" ]]; then
+    printf '%s' "$KVA_CONFIG"
+  else
+    printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/kva/config"
+  fi
+}
+
+read_context() {
+  local f line
+  f=$(context_file)
+  [[ -f "$f" ]] || return 0
+  line=$(grep -E '^current-context=' "$f" 2>/dev/null | tail -n 1 || true)
+  line=${line#current-context=}
+  line=${line%$'\r'}
+  printf '%s' "$line"
+}
+
+write_context() {
+  local id=$1 f dir
+  f=$(context_file)
+  dir=$(dirname "$f")
+  mkdir -p "$dir"
+  printf 'current-context=%s\n' "$id" >"$f"
+}
+
+clear_context() {
+  local f
+  f=$(context_file)
+  [[ -f "$f" ]] || return 0
+  rm -f "$f"
+}
+
+require_instance() {
+  if [[ -z "${INSTANCE_ID:-}" ]]; then
+    INSTANCE_ID=$(read_context)
+  fi
+  [[ -n "$INSTANCE_ID" ]] || die "missing -s INSTANCE_ID (no current context; run kva use-context ID)"
+}
+
+require_identity() {
+  [[ -n "$SSH_IDENTITY" && -f "$SSH_IDENTITY" ]] \
+    || die "missing ssh key: ${SSH_IDENTITY:-unset} (expected ~/.ssh/id_ed25519)"
+}
+
+# SSH sends local TERM. Ghostty/Kitty/etc. are missing from Vast images, so
+# remote tmux/ncurses abort with "missing or unsuitable terminal: xterm-ghostty".
+ssh_term() {
+  case ${TERM:-} in
+    xterm|xterm-256color|xterm-color|screen|screen-256color|tmux|tmux-256color|linux|vt100|dumb)
+      printf '%s' "$TERM"
+      ;;
+    *)
+      printf 'xterm-256color'
+      ;;
+  esac
+}
+
+ssh_opts() {
+  require_identity
+  SSH_OPTS=(
+    -o BatchMode=yes
+    -o StrictHostKeyChecking=accept-new
+    -o IdentitiesOnly=yes
+    -i "$SSH_IDENTITY"
+    -p "$SSH_PORT"
+  )
+  if ! kva_verbose; then
+    SSH_OPTS+=(-q)
+  fi
+}
+
+rsync_ssh() {
+  require_identity
+  local cmd quiet=${1:-}
+  cmd=$(printf 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i %q -p %q' \
+    "$SSH_IDENTITY" "$SSH_PORT")
+  if [[ "$quiet" != "loud" ]] && ! kva_verbose; then
+    cmd+=' -q'
+  fi
+  printf '%s' "$cmd"
+}
+
+parse_ssh_url() {
+  local raw line direct
+  require_cmd vastai
+  require_identity
+  raw=$(vastai show instance "$INSTANCE_ID" --raw --full --no-color) \
+    || die "vastai show instance failed for $INSTANCE_ID"
+  direct=$(printf '%s\n' "$raw" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+inst = data.get("instances", data)
+if isinstance(inst, list):
+    inst = inst[0] if inst else {}
+ip = inst.get("public_ipaddr") or ""
+port = inst.get("direct_port_end")
+if ip and port not in (None, "", -1, "-1", 0, "0"):
+    print(f"root@{ip}:{port}")
+')
+  if [[ -n "$direct" ]]; then
+    SSH_PORT=${direct##*:}
+    SSH_USERHOST=${direct%:*}
+  else
+    raw=$(vastai ssh-url "$INSTANCE_ID") || die "vastai ssh-url failed for instance $INSTANCE_ID"
+    line=$(printf '%s\n' "$raw" | grep -oE 'ssh://[^[:space:]]+' | tail -n 1 || true)
+    [[ -n "$line" ]] || die "could not parse ssh:// URL from: vastai ssh-url $INSTANCE_ID"
+    line=${line#ssh://}
+    SSH_PORT=${line##*:}
+    SSH_USERHOST=${line%:*}
+  fi
+  [[ -n "$SSH_USERHOST" && -n "$SSH_PORT" && "$SSH_PORT" != "$SSH_USERHOST" ]] \
+    || die "could not parse host:port for instance $INSTANCE_ID"
+  ssh_opts
+}
+
+remote_ssh() {
+  ssh "${SSH_OPTS[@]}" "$SSH_USERHOST" "$@"
+}
+
+quote_remote() {
+  printf '%q' "$1"
+}
+
+resolve_remote_path() {
+  local p=${1:-}
+  if [[ -z "$p" ]]; then
+    RESOLVED_REMOTE=/workspace/
+    return
+  fi
+  if [[ "$p" != /* ]]; then
+    p="/workspace/${p#./}"
+  fi
+  local norm=${p%/}
+  case "$norm" in
+    /|/root) die "refusing remote path $p (use /workspace/...)" ;;
+  esac
+  if [[ "$norm" == /root/* ]]; then
+    die "refusing remote path $p (use /workspace/...)"
+  fi
+  RESOLVED_REMOTE=$p
+}
+
+remote_parent_dir() {
+  local p=$1
+  if [[ "$p" == */ ]]; then
+    printf '%s' "$p"
+  else
+    printf '%s' "$(dirname "$p")"
+  fi
+}
+
+run_rsync_transfer() {
+  local src=$1 dst=$2 dry=$3
+  local e
+  e=$(rsync_ssh loud)
+  printf 'kva: rsync -avz --progress -e "%s" %q %q\n' "$e" "$src" "$dst"
+  if [[ "$dry" -eq 1 ]]; then
+    return 0
+  fi
+  require_cmd rsync
+  rsync -avz --progress -e "$e" "$src" "$dst"
+}
+
+parse_transfer_args() {
+  INSTANCE_ID=${VAST_INSTANCE_ID:-}
+  TRANSFER_SRC=""
+  TRANSFER_DST=""
+  TRANSFER_DRY=0
+  local -a pos=()
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -s|--session)
+        [[ $# -ge 2 ]] || die "-s requires an instance id"
+        INSTANCE_ID=$2
+        shift 2
+        ;;
+      --dry-run) TRANSFER_DRY=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; pos+=("$@"); break ;;
+      -*) die "unknown option: $1 (see kva ${TRANSFER_CMD} --help)" ;;
+      *) pos+=("$1"); shift ;;
+    esac
+  done
+  TRANSFER_SRC=""
+  TRANSFER_DST=""
+  if [[ ${#pos[@]} -ge 1 ]]; then
+    TRANSFER_SRC=${pos[0]}
+  fi
+  if [[ ${#pos[@]} -ge 2 ]]; then
+    TRANSFER_DST=${pos[1]}
+  fi
+  [[ ${#pos[@]} -le 2 ]] || die "too many arguments (see kva ${TRANSFER_CMD} --help)"
+  require_instance
+  [[ -n "$TRANSFER_SRC" ]] || die "missing ${TRANSFER_SRC_LABEL}"
+}
+
+kva_upload() {
+  TRANSFER_CMD=upload
+  TRANSFER_SRC_LABEL="LOCAL path"
+  parse_transfer_args "$@"
+  [[ -e "$TRANSFER_SRC" ]] || die "local path not found: $TRANSFER_SRC"
+  resolve_remote_path "$TRANSFER_DST"
+  parse_ssh_url
+  local remote_spec dest_dir
+  remote_spec="${SSH_USERHOST}:${RESOLVED_REMOTE}"
+  dest_dir=$(remote_parent_dir "$RESOLVED_REMOTE")
+  if [[ "$TRANSFER_DRY" -eq 0 ]]; then
+    remote_ssh "mkdir -p $(quote_remote "$dest_dir")"
+  fi
+  run_rsync_transfer "$TRANSFER_SRC" "$remote_spec" "$TRANSFER_DRY"
+}
+
+kva_download() {
+  TRANSFER_CMD=download
+  TRANSFER_SRC_LABEL="REMOTE path"
+  parse_transfer_args "$@"
+  resolve_remote_path "$TRANSFER_SRC"
+  local dest=${TRANSFER_DST:-./}
+  parse_ssh_url
+  local remote_spec
+  remote_spec="${SSH_USERHOST}:${RESOLVED_REMOTE}"
+  if [[ "$TRANSFER_DRY" -eq 0 ]]; then
+    if [[ "$dest" == */ || "$dest" == . || "$dest" == ./ || -d "$dest" ]]; then
+      mkdir -p "$dest"
+    else
+      mkdir -p "$(dirname "$dest")"
+    fi
+  fi
+  run_rsync_transfer "$remote_spec" "$dest" "$TRANSFER_DRY"
+}
+
+repo_rel_script() {
+  local f=$1 abs rel
+  if [[ "$f" != /* ]]; then
+    abs="$REPO_ROOT/$f"
+  else
+    abs=$f
+  fi
+  [[ -f "$abs" ]] || die "script not found: $f"
+  abs=$(cd "$(dirname "$abs")" && pwd)/$(basename "$abs")
+  case "$abs" in
+    "$REPO_ROOT"/*) rel=${abs#"$REPO_ROOT"/} ;;
+    *) die "script is outside the repo: $abs" ;;
+  esac
+  REL_SCRIPT=$rel
+}
+
+sync_repo() {
+  require_cmd rsync
+  remote_ssh "mkdir -p $(quote_remote "$REMOTE_DIR")"
+  rsync -az \
+    -e "$(rsync_ssh)" \
+    --exclude '.venv/' \
+    --exclude '.git/' \
+    --exclude 'datasets/' \
+    --exclude 'checkpoints/' \
+    --exclude 'runs/' \
+    --exclude '__pycache__/' \
+    --exclude '*.egg-info/' \
+    --exclude '.pytest_cache/' \
+    --exclude '.mypy_cache/' \
+    --exclude '.ruff_cache/' \
+    --exclude 'dist/' \
+    --exclude 'build/' \
+    --exclude 'notebooks/*_output.ipynb' \
+    "$REPO_ROOT/" "${SSH_USERHOST}:${REMOTE_DIR}/"
+}
+
+run_setup() {
+  local qdir
+  qdir=$(quote_remote "$REMOTE_DIR")
+  remote_ssh "set -euo pipefail; cd $qdir; $PYTHON_BIN -m pip install -e ."
+}
+
+log_header() {
+  local cmd_line="$PYTHON_BIN -u $REL_SCRIPT"
+  if ((${#EXTRA_ARGS[@]})); then
+    cmd_line+=" ${EXTRA_ARGS[*]}"
+  fi
+  cat <<EOF
+=== kva exec ===
+instance: $INSTANCE_ID
+host: $SSH_USERHOST
+port: $SSH_PORT
+identity: $SSH_IDENTITY
+script: $REL_SCRIPT
+started: $(date +%Y-%m-%dT%H:%M:%S%z)
+command: $cmd_line
+detach: $DETACH
+================
+EOF
+}
+
+remote_python_cmd() {
+  local qscript extra=() arg
+  qscript=$(quote_remote "$REL_SCRIPT")
+  for arg in "${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}"; do
+    extra+=("$(quote_remote "$arg")")
+  done
+  printf '%s -u %s %s' "$PYTHON_BIN" "$qscript" "${extra[*]-}"
+}
+
+storage_cost_cap() {
+  local day=$1 disk=$2
+  python3 -c "d=float('$day'); print('{:.4f}'.format(d * 30.0 / float('$disk')) if d > 0 else '')"
+}
+
+build_offer_query() {
+  local gpu=$1 max_dph=$2 inet_down=$3 min_ram=$4 disk=$5 max_storage=$6
+  local query="num_gpus=1 verified=true direct_port_count>=1 rentable=true dph<${max_dph} inet_down>=${inet_down} disk_space>=${disk}"
+  if [[ -n "$max_storage" ]]; then
+    query="${query} storage_cost<${max_storage}"
+  fi
+  if [[ -n "$gpu" ]]; then
+    query="gpu_name=${gpu} ${query}"
+  elif [[ -n "$min_ram" ]]; then
+    query="gpu_ram>=${min_ram} ${query}"
+  fi
+  printf '%s' "$query"
+}
+
+pick_cheap_offer() {
+  local gpu=$1 max_dph=$2 inet_down=$3 min_ram=$4 disk=$5 max_storage=$6
+  local query raw
+  query=$(build_offer_query "$gpu" "$max_dph" "$inet_down" "$min_ram" "$disk" "$max_storage")
+  printf 'kva: searching %s --storage %s\n' "$query" "$disk" >&2
+  raw=$(vastai search offers "$query" -o 'dlperf_usd-' --storage "$disk" --raw --full --no-color) \
+    || die "vastai search offers failed"
+  printf '%s\n' "$raw" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+offers = data if isinstance(data, list) else data.get("offers") or data.get("results") or []
+if not offers:
+    sys.exit(2)
+o = offers[0]
+dph = float(o.get("dph_total") or o.get("dph_base") or 0)
+loc = o.get("geolocation") or ""
+rel = o.get("reliability2") or o.get("reliability") or 0
+ram = float(o.get("gpu_ram") or 0)
+ram_gb = ram / 1024 if ram >= 256 else ram
+fields = (
+    str(o.get("id")),
+    str(o.get("gpu_name") or ""),
+    f"{dph:.4f}",
+    loc.replace("\t", " "),
+    f"{float(rel):.3f}",
+    f"{float(o.get("inet_down") or 0):.0f}",
+    f"{ram_gb:.0f}",
+    f"{float(o.get("storage_cost") or 0):.4f}",
+)
+print("\t".join(fields))
+'
+}
+
+confirm_yes() {
+  local yes=$1
+  local prompt=$2
+  if [[ "$yes" -eq 1 ]]; then
+    printf 'kva: --yes set; proceeding without prompt\n' >&2
+    return 0
+  fi
+  if [[ ! -t 0 ]]; then
+    die "refusing to proceed without a TTY; re-run with --yes"
+  fi
+  printf '%s [y/N] ' "$prompt"
+  local ans
+  read -r ans
+  case "$ans" in
+    y|Y|yes|YES) return 0 ;;
+    *) die "cancelled" ;;
+  esac
+}
+
+confirm_price() {
+  confirm_yes "$1" "Create this instance?"
+}
+
+wait_instance_running() {
+  local id=$1
+  local i status
+  for i in $(seq 1 40); do
+    status=$(vastai show instance "$id" --raw --full --no-color | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+inst = data.get("instances", data)
+if isinstance(inst, list):
+    inst = inst[0] if inst else {}
+print(inst.get("actual_status") or "")
+')
+    printf 'kva: instance %s status=%s\n' "$id" "${status:-unknown}"
+    case "$status" in
+      running) return 0 ;;
+      exited|unknown|offline)
+        die "instance $id entered $status; destroy it and try kva new again"
+        ;;
+    esac
+    sleep 15
+  done
+  die "timed out waiting for instance $id to become running"
+}
+
+kva_new() {
+  local size="small" gpu="" max_dph="" disk="20" max_disk_day="2" label="odyssey" inet_down="500" yes=0 dry=0
+  local min_ram="" filter_desc max_storage gpu_day disk_day total_day
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --size)
+        [[ $# -ge 2 ]] || die "--size requires small, medium, or large"
+        size=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+        shift 2
+        ;;
+      --gpu)
+        [[ $# -ge 2 ]] || die "--gpu requires a name"
+        gpu=$2
+        shift 2
+        ;;
+      --max-dph)
+        [[ $# -ge 2 ]] || die "--max-dph requires a USD value"
+        max_dph=$2
+        shift 2
+        ;;
+      --disk)
+        [[ $# -ge 2 ]] || die "--disk requires GB"
+        disk=$2
+        shift 2
+        ;;
+      --max-disk-day)
+        [[ $# -ge 2 ]] || die "--max-disk-day requires a USD value"
+        max_disk_day=$2
+        shift 2
+        ;;
+      --label)
+        [[ $# -ge 2 ]] || die "--label requires a name"
+        label=$2
+        shift 2
+        ;;
+      --inet-down)
+        [[ $# -ge 2 ]] || die "--inet-down requires Mbps"
+        inet_down=$2
+        shift 2
+        ;;
+      --yes|-y) yes=1; shift ;;
+      --dry-run) dry=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown option: $1 (see kva new --help)" ;;
+    esac
+  done
+
+  case "$size" in
+    small)
+      [[ -n "$gpu" ]] || gpu="RTX_3060"
+      [[ -n "$max_dph" ]] || max_dph="0.1"
+      ;;
+    medium)
+      [[ -n "$gpu" ]] || min_ram="20"
+      [[ -n "$max_dph" ]] || max_dph="0.5"
+      ;;
+    large)
+      [[ -n "$gpu" ]] || min_ram="40"
+      [[ -n "$max_dph" ]] || max_dph="2.5"
+      ;;
+    *) die "unknown --size: $size (use small, medium, or large)" ;;
+  esac
+
+  if [[ -n "$gpu" ]]; then
+    filter_desc=$gpu
+  else
+    filter_desc="size=$size (gpu_ram>=${min_ram})"
+  fi
+
+  max_storage=$(storage_cost_cap "$max_disk_day" "$disk")
+
+  if [[ "$dry" -eq 1 ]]; then
+    printf 'kva: size=%s max-dph=%s disk=%s max-disk-day=%s query=%s\n' \
+      "$size" "$max_dph" "$disk" "$max_disk_day" \
+      "$(build_offer_query "$gpu" "$max_dph" "$inet_down" "$min_ram" "$disk" "$max_storage")"
+    return 0
+  fi
+
+  require_cmd vastai
+  require_identity
+
+  local row offer_id gpu_name dph loc rel down ram sc
+  set +e
+  row=$(pick_cheap_offer "$gpu" "$max_dph" "$inet_down" "$min_ram" "$disk" "$max_storage")
+  local pick_rc=$?
+  set -e
+  [[ "$pick_rc" -eq 0 && -n "$row" ]] || die "no matching $filter_desc offers under \$$max_dph/hr with disk <\$${max_disk_day}/day; try --size, --gpu, --max-dph, or --max-disk-day"
+
+  IFS=$'\t' read -r offer_id gpu_name dph loc rel down ram sc <<<"$row"
+  gpu_day=$(python3 -c "print('{:.2f}'.format(float('$dph') * 24))")
+  disk_day=$(python3 -c "print('{:.2f}'.format(float('$sc') * float('$disk') / 30))")
+  total_day=$(python3 -c "print('{:.2f}'.format(float('$dph') * 24 + float('$sc') * float('$disk') / 30))")
+
+  cat <<EOF
+kva: cheapest matching offer (size=$size)
+  gpu:     $gpu_name  (${ram} GB)
+  offer:   $offer_id
+  price:   \$$dph / hour
+  day:     \$$total_day / 24h  (GPU \$$gpu_day + disk \$$disk_day)
+  loc:     $loc
+  rel:     $rel
+  down:    ${down} Mbps
+  disk:    ${disk} GB  (\$${sc}/GB/month, cap \$${max_disk_day}/day)
+
+WARNING: creating starts GPU + disk billing immediately.
+Destroy when done:  kva stop
+EOF
+
+  confirm_price "$yes"
+
+  local create_raw inst_id
+  create_raw=$(vastai create instance "$offer_id" \
+    --image vastai/pytorch:@vastai-automatic-tag \
+    --disk "$disk" --ssh --direct --label "$label" \
+    --cancel-unavail --raw --full --no-color) \
+    || die "vastai create instance failed (offer may have been taken; retry kva new)"
+  inst_id=$(printf '%s\n' "$create_raw" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+if not data.get("success"):
+    sys.exit(2)
+print(data.get("new_contract") or "")
+')
+  [[ -n "$inst_id" ]] || die "create succeeded but no instance id in response"
+  printf 'kva: created instance %s  (~$%s/hr)\n' "$inst_id" "$dph"
+  write_context "$inst_id"
+  wait_instance_running "$inst_id"
+  printf 'kva: ready  current-context=%s\n' "$inst_id"
+  printf '  kva exec -f notebooks/colab_odyssey.py\n'
+  printf '  kva stop\n'
+}
+
+kva_exec() {
+  INSTANCE_ID=${VAST_INSTANCE_ID:-}
+  local script_file="" setup=0 nosync=0
+  DETACH=0
+  EXTRA_ARGS=()
+
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -s|--session)
+        [[ $# -ge 2 ]] || die "-s requires an instance id"
+        INSTANCE_ID=$2
+        shift 2
+        ;;
+      -f|--file)
+        [[ $# -ge 2 ]] || die "-f requires a script path"
+        script_file=$2
+        shift 2
+        ;;
+      --setup) setup=1; shift ;;
+      --detach) DETACH=1; shift ;;
+      --no-sync) nosync=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; EXTRA_ARGS=("$@"); break ;;
+      *) die "unknown option: $1 (see kva exec --help)" ;;
+    esac
+  done
+
+  require_instance
+  [[ -n "$script_file" ]] || die "missing -f SCRIPT.py"
+  repo_rel_script "$script_file"
+  parse_ssh_url
+
+  local stamp stem
+  stamp=$(date +%Y%m%d-%H%M%S)
+  stem=$(basename "$REL_SCRIPT" .py)
+  LOG_NAME="${stamp}_${stem}.log"
+  LOCAL_LOG_DIR="$REPO_ROOT/runs/kva"
+  LOCAL_LOG="$LOCAL_LOG_DIR/$LOG_NAME"
+  REMOTE_LOG="$REMOTE_DIR/runs/kva/$LOG_NAME"
+  mkdir -p "$LOCAL_LOG_DIR"
+
+  if [[ "$nosync" -eq 0 ]]; then
+    kva_log "ssh -i $SSH_IDENTITY -p $SSH_PORT $SSH_USERHOST"
+    kva_log "syncing $REPO_ROOT -> $SSH_USERHOST:$REMOTE_DIR"
+    sync_repo
+  fi
+  remote_ssh "mkdir -p $(quote_remote "$REMOTE_DIR/runs/kva")"
+  if [[ "$setup" -eq 1 ]]; then
+    kva_log "pip install -e . on $SSH_USERHOST"
+    run_setup
+  fi
+
+  log_header >"$LOCAL_LOG"
+  if kva_verbose; then
+    cat "$LOCAL_LOG"
+  fi
+  remote_ssh "cat >> $(quote_remote "$REMOTE_LOG")" <"$LOCAL_LOG"
+
+  local qdir py
+  qdir=$(quote_remote "$REMOTE_DIR")
+  py=$(remote_python_cmd)
+
+  if [[ "$DETACH" -eq 1 ]]; then
+    local qlog pid
+    qlog=$(quote_remote "$REMOTE_LOG")
+    pid=$(remote_ssh "set -euo pipefail; cd $qdir; export PYTHONPATH=src PYTHONUNBUFFERED=1; nohup $py >> $qlog 2>&1 < /dev/null & echo \$!" | tail -n 1)
+    {
+      echo "detached pid: $pid"
+      echo "remote log: $REMOTE_LOG"
+      echo "local log: $LOCAL_LOG"
+    } | tee -a "$LOCAL_LOG"
+    return 0
+  fi
+
+  kva_log "running $REL_SCRIPT on $SSH_USERHOST (log $LOCAL_LOG)"
+  set +e
+  remote_ssh "set -euo pipefail; cd $qdir; export PYTHONPATH=src PYTHONUNBUFFERED=1; { $py; } 2>&1 | tee -a $(quote_remote "$REMOTE_LOG")" 2>&1 | tee -a "$LOCAL_LOG"
+  local rc=${PIPESTATUS[0]}
+  set -e
+  printf '\nkva: exit %s  log %s\n' "$rc" "$LOCAL_LOG" | tee -a "$LOCAL_LOG"
+  return "$rc"
+}
+
+kva_sessions() {
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown option: $1 (see kva sessions --help)" ;;
+    esac
+  done
+  require_cmd vastai
+  local raw
+  raw=$(vastai show instances --raw --full --no-color) \
+    || die "vastai show instances failed"
+  printf '%s\n' "$raw" | KVA_CURRENT_CONTEXT="$(read_context)" python3 -c '
+import json, os, sys
+
+def as_list(data):
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        insts = data.get("instances") or data.get("results") or data.get("data")
+        if isinstance(insts, list):
+            return insts
+        if isinstance(insts, dict):
+            return list(insts.values())
+        if "id" in data:
+            return [data]
+    return []
+
+data = json.load(sys.stdin)
+insts = as_list(data)
+cur = os.environ.get("KVA_CURRENT_CONTEXT") or ""
+rows = []
+for inst in insts:
+    if not isinstance(inst, dict):
+        continue
+    iid = str(inst.get("id") or "")
+    mark = "*" if iid == cur else ""
+    status = str(inst.get("actual_status") or inst.get("cur_state") or inst.get("status") or "")
+    gpu = str(inst.get("gpu_name") or "")
+    dph = inst.get("dph_total")
+    if dph is None:
+        dph = inst.get("dph_base") or 0
+    try:
+        dph_s = f"{float(dph):.4f}"
+    except (TypeError, ValueError):
+        dph_s = str(dph)
+    disk = inst.get("disk_space")
+    try:
+        disk_s = f"{float(disk):.0f}" if disk not in (None, "") else ""
+    except (TypeError, ValueError):
+        disk_s = str(disk or "")
+    label = str(inst.get("label") or "")
+    loc = str(inst.get("geolocation") or "").replace("\t", " ")
+    rows.append((mark, iid, status, gpu, dph_s, disk_s, label, loc))
+
+if not rows:
+    print("kva: no instances")
+    raise SystemExit(0)
+
+print(f"kva: {len(rows)} instance(s)")
+hdr = ("", "ID", "STATUS", "GPU", "$/HR", "DISK", "LABEL", "LOC")
+widths = [max(len(h), max(len(r[i]) for r in rows)) for i, h in enumerate(hdr)]
+fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+print(fmt.format(*hdr))
+for r in rows:
+    print(fmt.format(*r))
+'
+}
+
+kva_stop() {
+  INSTANCE_ID=${VAST_INSTANCE_ID:-}
+  local yes=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -s|--session)
+        [[ $# -ge 2 ]] || die "-s requires an instance id"
+        INSTANCE_ID=$2
+        shift 2
+        ;;
+      --yes|-y) yes=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown option: $1 (see kva stop --help)" ;;
+    esac
+  done
+  require_instance
+  require_cmd vastai
+  printf 'kva: destroy instance %s (GPU + disk billing stop)\n' "$INSTANCE_ID" >&2
+  printf 'WARNING: this cannot be undone; files on the instance are deleted.\n' >&2
+  confirm_yes "$yes" "Destroy this instance?"
+  vastai destroy instance "$INSTANCE_ID" -y \
+    || die "vastai destroy instance failed for $INSTANCE_ID"
+  printf 'kva: destroyed instance %s\n' "$INSTANCE_ID"
+  if [[ "$(read_context)" == "$INSTANCE_ID" ]]; then
+    clear_context
+    printf 'kva: current-context cleared\n'
+  fi
+}
+
+kva_ssh() {
+  INSTANCE_ID=${VAST_INSTANCE_ID:-}
+  local port=8080 forward="" dry=0
+  local -a extra=()
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -s|--session)
+        [[ $# -ge 2 ]] || die "-s requires an instance id"
+        INSTANCE_ID=$2
+        shift 2
+        ;;
+      --port)
+        [[ $# -ge 2 ]] || die "--port requires a port number"
+        port=$2
+        shift 2
+        ;;
+      -L)
+        [[ $# -ge 2 ]] || die "-L requires a forward spec"
+        forward=$2
+        shift 2
+        ;;
+      --dry-run) dry=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      --) shift; extra=("$@"); break ;;
+      *) die "unknown option: $1 (see kva ssh --help)" ;;
+    esac
+  done
+  require_instance
+  if [[ -z "$forward" ]]; then
+    forward="${port}:localhost:${port}"
+  fi
+  parse_ssh_url
+  local orig_term=${TERM:-} remote_term
+  remote_term=$(ssh_term)
+  export TERM="$remote_term"
+  local -a cmd=(
+    ssh
+    -o StrictHostKeyChecking=accept-new
+    -o IdentitiesOnly=yes
+    -i "$SSH_IDENTITY"
+    -p "$SSH_PORT"
+    -L "$forward"
+  )
+  if [[ ${#extra[@]} -eq 0 ]]; then
+    cmd+=(-t)
+  fi
+  cmd+=("$SSH_USERHOST")
+  if [[ ${#extra[@]} -gt 0 ]]; then
+    cmd+=("${extra[@]}")
+  fi
+  printf 'kva: forward http://127.0.0.1:%s  (-L %s)\n' "${forward%%:*}" "$forward"
+  if [[ "$orig_term" != "$remote_term" ]]; then
+    printf 'kva: TERM=%s (remote has no %s terminfo)\n' "$remote_term" "${orig_term:-unset}"
+  fi
+  printf 'kva:'
+  local a
+  for a in "${cmd[@]}"; do
+    printf ' %q' "$a"
+  done
+  printf '\n'
+  if [[ "$dry" -eq 1 ]]; then
+    return 0
+  fi
+  exec "${cmd[@]}"
+}
+
+kva_use_context() {
+  local unset=0 id=""
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      --unset) unset=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "unknown option: $1 (see kva use-context --help)" ;;
+      *)
+        [[ -z "$id" ]] || die "too many arguments (see kva use-context --help)"
+        id=$1
+        shift
+        ;;
+    esac
+  done
+  if [[ "$unset" -eq 1 ]]; then
+    clear_context
+    printf 'kva: current-context cleared\n'
+    return 0
+  fi
+  [[ -n "$id" ]] || die "use-context requires an instance id"
+  write_context "$id"
+  printf 'Switched to context "%s".\n' "$id"
+}
+
+kva_current_context() {
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown option: $1 (see kva current-context --help)" ;;
+    esac
+  done
+  local id
+  id=$(read_context)
+  [[ -n "$id" ]] || die "error: current-context is not set"
+  printf '%s\n' "$id"
+}
+
+cmd=${1:-}
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+case $cmd in
+  new|up) kva_new "$@" ;;
+  exec) kva_exec "$@" ;;
+  sessions) kva_sessions "$@" ;;
+  upload) kva_upload "$@" ;;
+  download) kva_download "$@" ;;
+  ssh) kva_ssh "$@" ;;
+  use-context|use) kva_use_context "$@" ;;
+  current-context|context) kva_current_context "$@" ;;
+  stop|destroy) kva_stop "$@" ;;
+  -h|--help|help|"") usage; exit 0 ;;
+  *)
+    printf 'kva: unknown command: %s\n\n' "$cmd" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

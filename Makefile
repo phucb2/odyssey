@@ -1,7 +1,7 @@
 # Odyssey — common uv/python targets
 # Usage: make <target>
 
-.PHONY: help install sync run compile package test clean
+.PHONY: help install sync run compile package colab-nb update test clean
 
 UV ?= uv
 
@@ -12,6 +12,8 @@ help: ## Show available targets
 	@echo "  run       Run the package (python -m odyssey)"
 	@echo "  compile   Byte-compile sources under src/"
 	@echo "  package   Build sdist and wheel into dist/"
+	@echo "  colab-nb  Embed src/odyssey into notebooks/colab_odyssey.py and .ipynb"
+	@echo "  update    Refresh ODYSSEY_B64 in existing Colab artifacts"
 	@echo "  test      Run pytest"
 	@echo "  clean     Remove build artifacts and caches"
 
@@ -29,6 +31,12 @@ compile: ## Compile Python sources to bytecode
 
 package: ## Build distributable packages (sdist + wheel)
 	$(UV) build
+
+colab-nb: ## Embed src/odyssey into notebooks/colab_odyssey.py and .ipynb
+	$(UV) run python scripts/build_colab_notebook.py
+
+update: ## Refresh ODYSSEY_B64 in notebooks/colab_odyssey.py and .ipynb
+	$(UV) run python scripts/update_colab_payload.py
 
 test: ## Run the test suite
 	$(UV) run pytest
