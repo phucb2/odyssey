@@ -17,6 +17,7 @@ vastai create instance <offer-id> --image pytorch/pytorch:2.4.0-cuda12.4-cudnn9-
 # Response includes "new_contract": <id>
 vastai launch instance --gpu-name RTX_4090 --num-gpus 1 --image pytorch/pytorch
 vastai start instance <id>
+vastai change bid <id> --price 0.12                      # raise interruptible bid; omit --price for a winning bid
 vastai stop instance <id>                                # disk preserved; disk still bills
 vastai reboot instance <id>
 vastai destroy instance <id> -y
@@ -75,6 +76,7 @@ vastai search invoices
 Flags: `--type on-demand|reserved|bid`, `--order/-o FIELD[-]`, `--limit`, `--storage GB`, `--no-default/-n`.
 
 Bid search exposes `min_bid`, but create still rents on-demand unless `--bid_price` is set.
+`kva new` defaults to spot (`--type bid` + `--bid_price` at `min_bid + --bid-pct`, default 10%). `kva resume` raises the bid 20% (`--bid-pct`) and starts. `--on-demand` for dedicated.
 
 ## SSH and keys
 

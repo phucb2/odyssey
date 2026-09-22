@@ -21,7 +21,7 @@ Agents that already know `colab` can translate:
 
 | Colab | Vast.ai |
 | --- | --- |
-| `colab new -s NAME --gpu T4` | `kva new --size medium` then `kva use-context ID` (new sets current-context) |
+| `colab new -s NAME --gpu T4` | `kva new --size medium` then `kva use-context ID` (new sets current-context; spot by default) |
 | `colab exec -s NAME -f script.py` | `kva exec -f script.py` (`-s` optional; current-context) |
 | `colab install -s NAME pkg` | `ssh ... 'pip install pkg'` (or `uv`) |
 | `colab sessions` / `status` | `kva sessions` (`*` is current-context) / `vastai show instance ID` |
@@ -105,10 +105,10 @@ Sort (`-o` / `--order`): `score` (default), `dlperf_usd`, `dph_total`, `num_gpus
   ```
 - `direct_port_count>=1` is required for `--direct`. Flags: `--type on-demand|reserved|bid`, `--limit`, `--storage GB`, `--no-default/-n`.
 - Empty result: filters are too tight. Drop `verified`, try another `gpu_name`, or `vastai search offers -n 'gpu_name=H100_SXM' --raw`.
-- `--type bid` is interruptible (spot). `create instance` still rents **on-demand at `dph_total`** unless you also pass `--bid_price`. When outbid the instance goes `stopped` (disk still bills); raise the bid with `update instance --bid_price`.
+- `--type bid` is interruptible (spot). `create instance` still rents **on-demand at `dph_total`** unless you also pass `--bid_price`. When outbid the instance goes `stopped` (disk still bills); raise the bid with `vastai change bid ID --price` (or `kva resume`).
 
 ### Provision
-- **Preferred shortcut:** `kva new` searches a cheap verified 1× GPU (`RTX_3060`, `$0.10/hr` cap), prints hourly + 24h price, and waits for `y/N` before `create instance`. `--size medium` is 20GB+ (`$0.50/hr` cap); `--size large` is 40GB+ (`$2.50/hr` cap). `--gpu NAME` still pins an exact card. Disk is capped at **$2/day for 20GB** (`storage_cost<3` $/GB/month; `--max-disk-day` to change, `0` to disable). Pass `--yes` only after the price is acceptable (required when stdin is not a TTY). Then: `kva exec -s <ID> -f ...`
+- **Preferred shortcut:** `kva new` searches a cheap verified 1× GPU (`RTX_3060`, `$0.10/hr` cap) as an **interruptible spot** instance (`--type bid` + `--bid_price`). Default bid is **10% above `min_bid`** (`--bid-pct 10`; `--bid-pct 0` bids the floor; `--bid-price USD` sets an exact bid; never above `--max-dph`). Offers are shown one at a time: `y` rent, `n` next, `q` quit. `--yes` takes the first. `--on-demand` rents dedicated. `--size medium` is 20GB+ (`$0.50/hr` cap); `--size large` is 40GB+ (`$2.50/hr` cap). `--gpu NAME` still pins an exact card. Disk is capped at **$2/day for 20GB** (`storage_cost<3` $/GB/month; `--max-disk-day` to change, `0` to disable). Pass `--yes` only after the price is acceptable (required when stdin is not a TTY). Then: `kva exec -s <ID> -f ...`. If outbid (status `stopped`), `kva resume` raises the bid 20% (`--bid-pct`) and starts; `--bid-price USD` sets an exact bid.
 - Create with SSH + direct, a label, and a Vast image tag that matches the host CUDA (`@vastai-automatic-tag` is resolved server-side; pass it unchanged):
   ```bash
   vastai create instance <OFFER_ID> --image vastai/pytorch:@vastai-automatic-tag --disk 20 --ssh --direct --label odyssey --raw
@@ -182,7 +182,7 @@ Sort (`-o` / `--order`): `score` (default), `dlperf_usd`, `dph_total`, `num_gpus
 - `vastai logs <ID> [--tail 100] [--filter error]` — container logs.
 - `vastai execute <ID> 'ls /workspace'` — directory listing only (`ls` / `rm` / `du`).
 - `vastai label instance <ID> --label training-run-1`
-- `vastai start instance <ID>` / `stop` / `reboot`. Stop preserves disk; GPU billing pauses; **disk billing continues**.
+- `vastai start instance <ID>` / `stop` / `reboot`. Stop preserves disk; GPU billing pauses; **disk billing continues**. Spot recovery: `kva resume` (`vastai change bid ID --price` then `start instance`).
 - **Always destroy when done:**
   ```bash
   kva stop -s <ID>          # prompts on a TTY

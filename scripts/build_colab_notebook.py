@@ -143,6 +143,7 @@ def unpack_source(payload: str) -> str:
 ODYSSEY_B64 = "{payload}"
 
 import base64
+import hashlib
 import importlib
 import io
 import sys
@@ -151,17 +152,28 @@ from pathlib import Path
 
 _root = Path("/content")
 _root.mkdir(parents=True, exist_ok=True)
-with tarfile.open(fileobj=io.BytesIO(base64.b64decode(ODYSSEY_B64)), mode="r:gz") as tf:
-    tf.extractall(_root, filter="data")
+_fp = hashlib.sha256(ODYSSEY_B64.encode("ascii")).hexdigest()
+_marker = _root / ".odyssey_b64.sha256"
+_hit = (
+    _marker.is_file()
+    and (_root / "odyssey" / "__init__.py").is_file()
+    and _marker.read_text().strip() == _fp
+)
+if not _hit:
+    with tarfile.open(fileobj=io.BytesIO(base64.b64decode(ODYSSEY_B64)), mode="r:gz") as tf:
+        tf.extractall(_root, filter="data")
+    _marker.write_text(_fp)
+    # Same Colab kernel keeps old imports; drop them so the new tree is loaded.
+    for _name in list(sys.modules):
+        if _name == "odyssey" or _name.startswith("odyssey."):
+            del sys.modules[_name]
+    importlib.invalidate_caches()
+    print("Unpacked Odyssey to", _root / "odyssey")
+else:
+    print("Cached Odyssey at", _root / "odyssey")
 _root_s = str(_root)
 sys.path = [p for p in sys.path if p != _root_s]
 sys.path.insert(0, _root_s)
-# Same Colab kernel keeps old imports; drop them so the new tree is loaded.
-for _name in list(sys.modules):
-    if _name == "odyssey" or _name.startswith("odyssey."):
-        del sys.modules[_name]
-importlib.invalidate_caches()
-print("Unpacked Odyssey to", _root / "odyssey")
 '''
 
 
@@ -171,12 +183,20 @@ def extras_source() -> str:
 # @title Install extras
 import subprocess
 import sys
+from pathlib import Path
 
 _EXTRAS = [
     {pkgs},
 ]
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *_EXTRAS])
-print("Installed extras:", ", ".join(_EXTRAS))
+_extras_marker = Path("/content/.odyssey_extras.txt")
+_extras_key = "\\n".join(_EXTRAS)
+if _extras_marker.is_file() and _extras_marker.read_text() == _extras_key:
+    print("Cached extras")
+else:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", *_EXTRAS])
+    _extras_marker.parent.mkdir(parents=True, exist_ok=True)
+    _extras_marker.write_text(_extras_key)
+    print("Installed extras:", ", ".join(_EXTRAS))
 '''
 
 

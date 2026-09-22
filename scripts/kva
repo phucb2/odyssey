@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # kva — Vast.ai exec CLI (colab exec analogue).
 # Usage:
+#   kva new [--spot] [--on-demand]
+#   kva resume [--bid-price USD]
 #   kva use-context INSTANCE_ID
 #   kva sessions
 #   kva exec -f script.py
@@ -24,7 +26,8 @@ usage() {
 kva — Vast.ai analogue of `colab exec -s ... -f ...`
 
 Usage:
-  kva new [--size small|medium|large] [--gpu RTX_3060] [--max-dph 0.1] [--disk 20] [--yes]
+  kva new [--spot|--on-demand] [--bid-pct 10] [--size small|medium|large] [--gpu RTX_3060] [--max-dph 0.1] [--disk 20] [--yes]
+  kva resume [-s INSTANCE_ID] [--bid-pct 20] [--bid-price USD] [--yes]
   kva use-context INSTANCE_ID
   kva current-context
   kva sessions
@@ -35,14 +38,34 @@ Usage:
   kva stop [-s INSTANCE_ID] [--yes]
 
 kva new:
+  --spot             interruptible bid (spot) instance (default)
+  --on-demand        dedicated on-demand instance
+  --bid-pct PCT      bid this percent above min_bid (default: 10; 0 = exact min)
+  --bid-price USD    exact spot bid $/hour (overrides --bid-pct)
   --size SIZE        GPU tier: small (default, RTX_3060), medium (20GB+), large (40GB+)
   --gpu NAME         exact GPU name (overrides --size VRAM floor)
   --max-dph USD      max GPU $/hour (default: small 0.1, medium 0.5, large 2.5)
   --disk GB          disk size (default: 20)
   --max-disk-day USD max disk $/day (default: 2 for 20GB; 0 disables)
   --label NAME       instance label (default: odyssey)
-  --yes, -y          skip the price prompt (required if stdin is not a TTY)
+  --yes, -y          take the first offer (required if stdin is not a TTY)
   --dry-run          print the search query and exit
+
+  Offers are shown one at a time (cheapest first):
+    y  rent this offer
+    n  skip to the next offer (default)
+    q  quit
+
+
+kva resume:
+  -s, --session ID   Vast.ai instance ID (overrides current-context / \$VAST_INSTANCE_ID)
+  --bid-pct PCT      raise bid by this percent (default: 20)
+  --bid-price USD    exact bid $/hour (default: current + --bid-pct, at least +\$0.01)
+  --yes, -y          skip the bid prompt (required if stdin is not a TTY)
+  --dry-run          print the new bid and start command, then exit
+
+  Raise the spot bid and start a stopped instance (after being outbid).
+  Already-running instances are left alone unless --bid-price is set.
 
 kva sessions:
   list all Vast.ai instances (id, status, gpu, price). * is current-context.
@@ -456,12 +479,12 @@ build_offer_query() {
   printf '%s' "$query"
 }
 
-pick_cheap_offer() {
-  local gpu=$1 max_dph=$2 inet_down=$3 min_ram=$4 disk=$5 max_storage=$6
+search_offers() {
+  local gpu=$1 max_dph=$2 inet_down=$3 min_ram=$4 disk=$5 max_storage=$6 offer_type=${7:-bid}
   local query raw
   query=$(build_offer_query "$gpu" "$max_dph" "$inet_down" "$min_ram" "$disk" "$max_storage")
-  printf 'kva: searching %s --storage %s\n' "$query" "$disk" >&2
-  raw=$(vastai search offers "$query" -o 'dlperf_usd-' --storage "$disk" --raw --full --no-color) \
+  printf 'kva: searching %s --storage %s --type %s\n' "$query" "$disk" "$offer_type" >&2
+  raw=$(vastai search offers "$query" -o 'dlperf_usd-' --storage "$disk" --type "$offer_type" --limit 12 --raw --full --no-color) \
     || die "vastai search offers failed"
   printf '%s\n' "$raw" | python3 -c '
 import json, sys
@@ -469,23 +492,130 @@ data = json.load(sys.stdin)
 offers = data if isinstance(data, list) else data.get("offers") or data.get("results") or []
 if not offers:
     sys.exit(2)
-o = offers[0]
-dph = float(o.get("dph_total") or o.get("dph_base") or 0)
-loc = o.get("geolocation") or ""
-rel = o.get("reliability2") or o.get("reliability") or 0
-ram = float(o.get("gpu_ram") or 0)
-ram_gb = ram / 1024 if ram >= 256 else ram
-fields = (
-    str(o.get("id")),
-    str(o.get("gpu_name") or ""),
-    f"{dph:.4f}",
-    loc.replace("\t", " "),
-    f"{float(rel):.3f}",
-    f"{float(o.get("inet_down") or 0):.0f}",
-    f"{ram_gb:.0f}",
-    f"{float(o.get("storage_cost") or 0):.4f}",
-)
-print("\t".join(fields))
+offer_type = sys.argv[1] if len(sys.argv) > 1 else "bid"
+for o in offers[:12]:
+    dph = float(o.get("dph_total") or o.get("dph_base") or 0)
+    if offer_type == "bid":
+        dph = float(o.get("min_bid") or dph)
+    loc = o.get("geolocation") or ""
+    rel = o.get("reliability2") or o.get("reliability") or 0
+    ram = float(o.get("gpu_ram") or 0)
+    ram_gb = ram / 1024 if ram >= 256 else ram
+    fields = (
+        str(o.get("id")),
+        str(o.get("gpu_name") or ""),
+        f"{dph:.4f}",
+        loc.replace("\t", " "),
+        f"{float(rel):.3f}",
+        f"{float(o.get("inet_down") or 0):.0f}",
+        f"{ram_gb:.0f}",
+        f"{float(o.get("storage_cost") or 0):.4f}",
+    )
+    print("\t".join(fields))
+' "$offer_type"
+}
+
+parse_new_contract() {
+  python3 -c '
+import json, sys
+text = sys.stdin.read()
+obj = None
+raw = text.strip()
+if raw:
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        i = -1
+        for ch in "{[":
+            j = text.find(ch)
+            if j >= 0 and (i < 0 or j < i):
+                i = j
+        if i >= 0:
+            try:
+                obj, _ = json.JSONDecoder().raw_decode(text[i:])
+            except json.JSONDecodeError:
+                obj = None
+if isinstance(obj, dict) and obj.get("success") and obj.get("new_contract") not in (None, ""):
+    print(obj["new_contract"])
+    raise SystemExit(0)
+msg = ""
+code = None
+if isinstance(obj, dict):
+    msg = str(obj.get("msg") or "")
+    code = obj.get("status_code")
+    err = obj.get("error")
+    print(msg or (err if isinstance(err, str) else raw) or "create failed", file=sys.stderr)
+elif raw:
+    print(raw, file=sys.stderr)
+retry = code == 410 or "no_such_ask" in msg.lower()
+raise SystemExit(3 if retry else 4)
+'
+}
+
+print_offer_card() {
+  local idx=$1 total=$2 size=$3 offer_type=$4 price_kind=$5
+  local offer_id=$6 gpu_name=$7 create_bid=$8 loc=$9 rel=${10} down=${11} ram=${12} sc=${13} disk=${14} max_disk_day=${15}
+  local gpu_day disk_day total_day
+  gpu_day=$(python3 -c "print('{:.2f}'.format(float('$create_bid') * 24))")
+  disk_day=$(python3 -c "print('{:.2f}'.format(float('$sc') * float('$disk') / 30))")
+  total_day=$(python3 -c "print('{:.2f}'.format(float('$create_bid') * 24 + float('$sc') * float('$disk') / 30))")
+  cat <<EOF
+kva: offer ${idx}/${total}  (size=$size type=$offer_type)
+  gpu:     $gpu_name  (${ram} GB)
+  offer:   $offer_id
+  price:   \$$create_bid / hour  ($price_kind)
+  day:     \$$total_day / 24h  (GPU \$$gpu_day + disk \$$disk_day)
+  loc:     $loc
+  rel:     $rel
+  down:    ${down} Mbps
+  disk:    ${disk} GB  (\$${sc}/GB/month, cap \$${max_disk_day}/day)
+EOF
+}
+
+next_bid_price() {
+  local current=$1 bump=${2:-0.20} explicit=${3:-} cap=${4:-}
+  python3 -c "
+c = float('$current' or 0)
+explicit = '$explicit'
+bump = float('$bump' or 0)
+cap = '$cap'
+if explicit:
+    p = float(explicit)
+elif bump <= 0:
+    p = c
+else:
+    p = max(c * (1 + bump), c + 0.01, 0.01)
+if cap:
+    p = min(p, float(cap))
+if p < 0:
+    p = 0
+print('{:.4f}'.format(p))
+"
+}
+
+read_instance_info() {
+  local raw
+  raw=$(vastai show instance "$1" --raw --full --no-color) \
+    || die "vastai show instance failed for $1"
+  printf '%s\n' "$raw" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+inst = data.get("instances", data)
+if isinstance(inst, list):
+    inst = inst[0] if inst else {}
+status = str(inst.get("actual_status") or inst.get("cur_state") or "")
+dph = inst.get("dph_total")
+if dph is None:
+    dph = inst.get("min_bid") or inst.get("dph_base") or 0
+is_bid = inst.get("is_bid")
+if is_bid is True:
+    is_bid_s = "1"
+elif is_bid is False:
+    is_bid_s = "0"
+else:
+    is_bid_s = ""
+gpu = str(inst.get("gpu_name") or "").replace("\t", " ")
+print("\t".join([status, f"{float(dph):.4f}", is_bid_s, gpu]))
 '
 }
 
@@ -508,8 +638,30 @@ confirm_yes() {
   esac
 }
 
-confirm_price() {
-  confirm_yes "$1" "Create this instance?"
+# 0 = rent this offer, 1 = next offer, 2 = quit
+confirm_offer() {
+  local yes=$1 idx=$2 total=$3
+  local prompt="Create this instance? [y]es / [n]ext / [q]uit"
+  if [[ "$yes" -eq 1 ]]; then
+    printf 'kva: --yes set; taking offer %s/%s\n' "$idx" "$total" >&2
+    return 0
+  fi
+  local ans
+  if [[ -t 0 ]]; then
+    printf '%s ' "$prompt"
+    read -r ans || return 2
+  else
+    read -r ans || die "refusing to proceed without a TTY; re-run with --yes"
+  fi
+  case "$ans" in
+    y|Y|yes|YES) return 0 ;;
+    q|Q|quit|QUIT) return 2 ;;
+    n|N|no|NO|"") return 1 ;;
+    *)
+      printf 'kva: unknown answer %s (use y, n, or q)\n' "$ans" >&2
+      return 1
+      ;;
+  esac
 }
 
 wait_instance_running() {
@@ -538,7 +690,8 @@ print(inst.get("actual_status") or "")
 
 kva_new() {
   local size="small" gpu="" max_dph="" disk="20" max_disk_day="2" label="odyssey" inet_down="500" yes=0 dry=0
-  local min_ram="" filter_desc max_storage gpu_day disk_day total_day
+  local spot=1 bid_price="" bid_pct="10" bid_pct_set=0 min_ram="" filter_desc max_storage
+  local offer_type create_bid price_kind bid_frac kind
   while [[ $# -gt 0 ]]; do
     case $1 in
       --size)
@@ -576,12 +729,37 @@ kva_new() {
         inet_down=$2
         shift 2
         ;;
+      --spot) spot=1; shift ;;
+      --on-demand) spot=0; shift ;;
+      --bid-pct|--bid-price-pct)
+        [[ $# -ge 2 ]] || die "--bid-pct requires a percent (e.g. 10)"
+        bid_pct=$2
+        bid_pct_set=1
+        spot=1
+        shift 2
+        ;;
+      --bid-price)
+        [[ $# -ge 2 ]] || die "--bid-price requires a USD value"
+        bid_price=$2
+        spot=1
+        shift 2
+        ;;
       --yes|-y) yes=1; shift ;;
       --dry-run) dry=1; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "unknown option: $1 (see kva new --help)" ;;
     esac
   done
+
+  if [[ "$spot" -eq 0 && ( -n "$bid_price" || "$bid_pct_set" -eq 1 ) ]]; then
+    die "--bid-pct / --bid-price require a spot instance (omit --on-demand)"
+  fi
+  python3 -c "
+p = float('$bid_pct')
+if p < 0:
+    raise SystemExit(1)
+" || die "--bid-pct must be a number >= 0"
+  bid_frac=$(python3 -c "print('{:.6f}'.format(float('$bid_pct') / 100.0))")
 
   case "$size" in
     small)
@@ -606,10 +784,17 @@ kva_new() {
   fi
 
   max_storage=$(storage_cost_cap "$max_disk_day" "$disk")
+  if [[ "$spot" -eq 1 ]]; then
+    offer_type=bid
+    price_kind="spot bid"
+  else
+    offer_type=on-demand
+    price_kind="on-demand"
+  fi
 
   if [[ "$dry" -eq 1 ]]; then
-    printf 'kva: size=%s max-dph=%s disk=%s max-disk-day=%s query=%s\n' \
-      "$size" "$max_dph" "$disk" "$max_disk_day" \
+    printf 'kva: size=%s max-dph=%s disk=%s max-disk-day=%s type=%s bid-pct=%s query=%s\n' \
+      "$size" "$max_dph" "$disk" "$max_disk_day" "$offer_type" "$bid_pct" \
       "$(build_offer_query "$gpu" "$max_dph" "$inet_down" "$min_ram" "$disk" "$max_storage")"
     return 0
   fi
@@ -618,53 +803,101 @@ kva_new() {
   require_identity
 
   local row offer_id gpu_name dph loc rel down ram sc
+  local -a rows=()
   set +e
-  row=$(pick_cheap_offer "$gpu" "$max_dph" "$inet_down" "$min_ram" "$disk" "$max_storage")
+  row=$(search_offers "$gpu" "$max_dph" "$inet_down" "$min_ram" "$disk" "$max_storage" "$offer_type")
   local pick_rc=$?
   set -e
   [[ "$pick_rc" -eq 0 && -n "$row" ]] || die "no matching $filter_desc offers under \$$max_dph/hr with disk <\$${max_disk_day}/day; try --size, --gpu, --max-dph, or --max-disk-day"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && rows+=("$line")
+  done <<<"$row"
+  local total=${#rows[@]}
+  [[ "$total" -gt 0 ]] || die "no matching $filter_desc offers under \$$max_dph/hr with disk <\$${max_disk_day}/day; try --size, --gpu, --max-dph, or --max-disk-day"
+  printf 'kva: %s matching offer(s); y=rent  n=next  q=quit\n' "$total"
 
-  IFS=$'\t' read -r offer_id gpu_name dph loc rel down ram sc <<<"$row"
-  gpu_day=$(python3 -c "print('{:.2f}'.format(float('$dph') * 24))")
-  disk_day=$(python3 -c "print('{:.2f}'.format(float('$sc') * float('$disk') / 30))")
-  total_day=$(python3 -c "print('{:.2f}'.format(float('$dph') * 24 + float('$sc') * float('$disk') / 30))")
+  if [[ "$spot" -eq 1 ]]; then
+    cat <<EOF
 
-  cat <<EOF
-kva: cheapest matching offer (size=$size)
-  gpu:     $gpu_name  (${ram} GB)
-  offer:   $offer_id
-  price:   \$$dph / hour
-  day:     \$$total_day / 24h  (GPU \$$gpu_day + disk \$$disk_day)
-  loc:     $loc
-  rel:     $rel
-  down:    ${down} Mbps
-  disk:    ${disk} GB  (\$${sc}/GB/month, cap \$${max_disk_day}/day)
+WARNING: creating starts GPU + disk billing immediately.
+This is an interruptible (spot) instance — it can stop if outbid.
+Resume with a higher bid:  kva resume
+Destroy when done:         kva stop
+EOF
+  else
+    cat <<EOF
 
 WARNING: creating starts GPU + disk billing immediately.
 Destroy when done:  kva stop
 EOF
+  fi
 
-  confirm_price "$yes"
+  local i idx choice create_raw parse_rc inst_id="" selected_bid=""
+  for i in "${!rows[@]}"; do
+    IFS=$'\t' read -r offer_id gpu_name dph loc rel down ram sc <<<"${rows[$i]}"
+    idx=$((i + 1))
+    create_bid=$dph
+    kind=$price_kind
+    if [[ "$spot" -eq 1 ]]; then
+      create_bid=$(next_bid_price "$dph" "$bid_frac" "$bid_price" "$max_dph")
+      if [[ -n "$bid_price" || "$bid_pct" == "0" ]]; then
+        kind="spot bid"
+      else
+        kind="spot bid, min \$${dph} +${bid_pct}%"
+      fi
+    fi
+    print_offer_card "$idx" "$total" "$size" "$offer_type" "$kind" \
+      "$offer_id" "$gpu_name" "$create_bid" "$loc" "$rel" "$down" "$ram" "$sc" "$disk" "$max_disk_day"
 
-  local create_raw inst_id
-  create_raw=$(vastai create instance "$offer_id" \
-    --image vastai/pytorch:@vastai-automatic-tag \
-    --disk "$disk" --ssh --direct --label "$label" \
-    --cancel-unavail --raw --full --no-color) \
-    || die "vastai create instance failed (offer may have been taken; retry kva new)"
-  inst_id=$(printf '%s\n' "$create_raw" | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-if not data.get("success"):
-    sys.exit(2)
-print(data.get("new_contract") or "")
-')
-  [[ -n "$inst_id" ]] || die "create succeeded but no instance id in response"
-  printf 'kva: created instance %s  (~$%s/hr)\n' "$inst_id" "$dph"
+    set +e
+    confirm_offer "$yes" "$idx" "$total"
+    choice=$?
+    set -e
+    case "$choice" in
+      0) ;;
+      1)
+        printf 'kva: skipping offer %s\n' "$offer_id"
+        continue
+        ;;
+      *) die "cancelled" ;;
+    esac
+
+    local -a create_args=(
+      create instance "$offer_id"
+      --image vastai/pytorch:@vastai-automatic-tag
+      --disk "$disk" --ssh --direct --label "$label"
+      --cancel-unavail --raw --full --no-color
+    )
+    if [[ "$spot" -eq 1 ]]; then
+      create_args+=(--bid_price "$create_bid")
+    fi
+    set +e
+    create_raw=$(vastai "${create_args[@]}" 2>&1)
+    set -e
+    set +e
+    inst_id=$(printf '%s\n' "$create_raw" | parse_new_contract)
+    parse_rc=$?
+    set -e
+    if [[ "$parse_rc" -eq 0 && -n "$inst_id" ]]; then
+      selected_bid=$create_bid
+      break
+    fi
+    if [[ "$parse_rc" -eq 3 ]]; then
+      printf 'kva: offer %s is no longer available; trying next\n' "$offer_id"
+      inst_id=""
+      continue
+    fi
+    die "vastai create instance failed${create_raw:+: ${create_raw}}"
+  done
+  [[ -n "$inst_id" ]] || die "no offer selected (or all were taken); retry kva new"
+  printf 'kva: created instance %s  (~$%s/hr %s)\n' "$inst_id" "$selected_bid" "$price_kind"
   write_context "$inst_id"
   wait_instance_running "$inst_id"
   printf 'kva: ready  current-context=%s\n' "$inst_id"
   printf '  kva exec -f notebooks/colab_odyssey.py\n'
+  if [[ "$spot" -eq 1 ]]; then
+    printf '  kva resume\n'
+  fi
   printf '  kva stop\n'
 }
 
@@ -819,6 +1052,100 @@ for r in rows:
 '
 }
 
+kva_resume() {
+  INSTANCE_ID=${VAST_INSTANCE_ID:-}
+  local yes=0 dry=0 bid_price="" bid_pct="20" bid_pct_set=0
+  while [[ $# -gt 0 ]]; do
+    case $1 in
+      -s|--session)
+        [[ $# -ge 2 ]] || die "-s requires an instance id"
+        INSTANCE_ID=$2
+        shift 2
+        ;;
+      --bid-pct|--bid-price-pct)
+        [[ $# -ge 2 ]] || die "--bid-pct requires a percent (e.g. 20)"
+        bid_pct=$2
+        bid_pct_set=1
+        shift 2
+        ;;
+      --bid-price)
+        [[ $# -ge 2 ]] || die "--bid-price requires a USD value"
+        bid_price=$2
+        shift 2
+        ;;
+      --yes|-y) yes=1; shift ;;
+      --dry-run) dry=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown option: $1 (see kva resume --help)" ;;
+    esac
+  done
+  require_instance
+  require_cmd vastai
+  python3 -c "
+p = float('$bid_pct')
+if p < 0:
+    raise SystemExit(1)
+" || die "--bid-pct must be a number >= 0"
+  local bid_frac
+  bid_frac=$(python3 -c "print('{:.6f}'.format(float('$bid_pct') / 100.0))")
+
+  local status current_bid is_bid gpu_name new_bid
+  IFS=$'\t' read -r status current_bid is_bid gpu_name <<<"$(read_instance_info "$INSTANCE_ID")"
+  new_bid=$(next_bid_price "$current_bid" "$bid_frac" "$bid_price")
+
+  if [[ "$status" == "running" && -z "$bid_price" && "$bid_pct_set" -eq 0 ]]; then
+    printf 'kva: instance %s is already running ($%s/hr)\n' "$INSTANCE_ID" "$current_bid"
+    return 0
+  fi
+
+  cat <<EOF
+kva: resume instance $INSTANCE_ID  (status=${status:-unknown}  gpu=${gpu_name:-?})
+  current bid: \$$current_bid / hour
+  new bid:     \$$new_bid / hour
+EOF
+  if [[ "$status" == "running" ]]; then
+    printf 'kva: instance is running; will raise bid only\n'
+  else
+    printf 'WARNING: a higher bid increases GPU cost if the instance starts.\n'
+  fi
+
+  if [[ "$dry" -eq 1 ]]; then
+    printf 'kva: vastai change bid %s --price %s\n' "$INSTANCE_ID" "$new_bid"
+    if [[ "$status" != "running" ]]; then
+      printf 'kva: vastai start instance %s\n' "$INSTANCE_ID"
+    fi
+    return 0
+  fi
+
+  if [[ "$status" == "running" ]]; then
+    confirm_yes "$yes" "Raise bid to \$$new_bid/hr?"
+  else
+    confirm_yes "$yes" "Raise bid to \$$new_bid/hr and start?"
+  fi
+
+  set +e
+  vastai change bid "$INSTANCE_ID" --price "$new_bid" --raw --full --no-color
+  local bid_rc=$?
+  set -e
+  if [[ "$bid_rc" -ne 0 ]]; then
+    if [[ -n "$bid_price" || "$is_bid" == "1" ]]; then
+      die "vastai change bid failed for $INSTANCE_ID"
+    fi
+    printf 'kva: change bid failed (on-demand instance?); starting without a new bid\n' >&2
+  else
+    printf 'kva: bid %s -> $%s/hr\n' "$INSTANCE_ID" "$new_bid"
+  fi
+
+  if [[ "$status" == "running" ]]; then
+    return 0
+  fi
+  vastai start instance "$INSTANCE_ID" --raw --full --no-color \
+    || die "vastai start instance failed for $INSTANCE_ID"
+  printf 'kva: starting instance %s\n' "$INSTANCE_ID"
+  wait_instance_running "$INSTANCE_ID"
+  printf 'kva: ready  current-context=%s  ~$%s/hr\n' "$INSTANCE_ID" "$new_bid"
+}
+
 kva_stop() {
   INSTANCE_ID=${VAST_INSTANCE_ID:-}
   local yes=0
@@ -964,6 +1291,7 @@ case $cmd in
   ssh) kva_ssh "$@" ;;
   use-context|use) kva_use_context "$@" ;;
   current-context|context) kva_current_context "$@" ;;
+  resume|start) kva_resume "$@" ;;
   stop|destroy) kva_stop "$@" ;;
   -h|--help|help|"") usage; exit 0 ;;
   *)

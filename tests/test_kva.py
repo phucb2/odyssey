@@ -29,6 +29,7 @@ def test_kva_help():
     r = subprocess.run(["bash", str(KVA), "--help"], capture_output=True, text=True, check=False)
     assert r.returncode == 0
     assert "kva new" in r.stdout
+    assert "kva resume" in r.stdout
     assert "kva sessions" in r.stdout
     assert "kva upload" in r.stdout
     assert "kva download" in r.stdout
@@ -50,8 +51,14 @@ def test_kva_new_help():
     assert r.returncode == 0
     assert "--max-dph" in r.stdout
     assert "--size" in r.stdout
+    assert "--spot" in r.stdout
+    assert "--on-demand" in r.stdout
+    assert "--bid-price" in r.stdout
+    assert "--bid-pct" in r.stdout
     assert "--max-disk-day" in r.stdout
     assert "medium" in r.stdout
+    assert "skip to the next" in r.stdout
+    assert "quit" in r.stdout
     assert "Create this instance?" not in r.stdout
 
 
@@ -75,6 +82,8 @@ def test_kva_new_size_queries():
     )
     assert "size=small" in small.stdout
     assert "max-dph=0.1" in small.stdout
+    assert "type=bid" in small.stdout
+    assert "bid-pct=10" in small.stdout
     assert "gpu_name=RTX_3060" in small.stdout
     assert "gpu_ram>=" not in small.stdout
 
@@ -141,6 +150,371 @@ def test_kva_new_excludes_expensive_storage():
     assert "disk_space>=20" in uncapped.stdout
 
 
+def test_kva_new_spot_is_default():
+    default = subprocess.run(
+        ["bash", str(KVA), "new", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "type=bid" in default.stdout
+
+    explicit = subprocess.run(
+        ["bash", str(KVA), "new", "--spot", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "type=bid" in explicit.stdout
+
+
+def test_kva_new_on_demand_dry_run():
+    r = subprocess.run(
+        ["bash", str(KVA), "new", "--on-demand", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "type=on-demand" in r.stdout
+    assert "type=bid" not in r.stdout
+
+
+def test_kva_new_bid_pct_dry_run():
+    bumped = subprocess.run(
+        ["bash", str(KVA), "new", "--bid-pct", "25", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "bid-pct=25" in bumped.stdout
+    assert "type=bid" in bumped.stdout
+
+    floor = subprocess.run(
+        ["bash", str(KVA), "new", "--bid-pct", "0", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "bid-pct=0" in floor.stdout
+
+
+def _offer(
+    oid: int,
+    *,
+    gpu: str = "RTX 5090",
+    dph: float = 0.3,
+    ram: float = 32,
+) -> dict:
+    return {
+        "id": oid,
+        "gpu_name": gpu,
+        "dph_total": dph,
+        "min_bid": dph,
+        "geolocation": "US",
+        "reliability": 0.99,
+        "inet_down": 600,
+        "gpu_ram": ram,
+        "storage_cost": 0.2,
+    }
+
+
+def _kva_new_env(tmp_path: Path, offers: list, **kwargs) -> dict[str, str]:
+    running = json.dumps(
+        {"id": 777, "actual_status": "running", "gpu_name": "RTX 5090", "dph_total": 0.3}
+    )
+    env = _fake_vastai_env(
+        tmp_path,
+        instances_json="[]",
+        instance_json=running,
+        running_json=running,
+        search_json=json.dumps(offers),
+        **kwargs,
+    )
+    key = tmp_path / "id_ed25519"
+    key.write_text("dummy\n", encoding="utf-8")
+    env["KVA_SSH_IDENTITY"] = str(key)
+    return env
+
+
+def test_kva_new_on_demand_passes_type(tmp_path):
+    search = tmp_path / "search.args"
+    env = _kva_new_env(tmp_path, [_offer(11)], search_log=search)
+    r = subprocess.run(
+        ["bash", str(KVA), "new", "--on-demand", "--size", "medium", "--yes"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "--type on-demand" in search.read_text(encoding="utf-8")
+    assert "created instance 777" in r.stdout
+    assert "--bid_price" not in (tmp_path / "create.args").read_text(encoding="utf-8")
+
+
+def test_kva_new_yes_takes_first_offer(tmp_path):
+    create = tmp_path / "create.args"
+    env = _kva_new_env(
+        tmp_path,
+        [_offer(11, gpu="RTX 5090"), _offer(22, gpu="L40S")],
+        create_log=create,
+    )
+    r = subprocess.run(
+        ["bash", str(KVA), "new", "--size", "medium", "--yes"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "offer 1/2" in r.stdout
+    assert "create instance 11" in create.read_text(encoding="utf-8")
+    assert "--bid_price 0.3300" in create.read_text(encoding="utf-8")
+    assert "create instance 22" not in create.read_text(encoding="utf-8")
+
+
+def test_kva_new_bid_pct_applied(tmp_path):
+    create = tmp_path / "create.args"
+    env = _kva_new_env(tmp_path, [_offer(11, dph=0.3)], create_log=create)
+    r = subprocess.run(
+        ["bash", str(KVA), "new", "--size", "medium", "--bid-pct", "20", "--yes"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "min $0.3000 +20%" in r.stdout
+    assert "--bid_price 0.3600" in create.read_text(encoding="utf-8")
+
+
+def test_kva_new_bid_price_overrides_pct(tmp_path):
+    create = tmp_path / "create.args"
+    env = _kva_new_env(tmp_path, [_offer(11, dph=0.3)], create_log=create)
+    r = subprocess.run(
+        ["bash", str(KVA), "new", "--size", "medium", "--bid-pct", "50", "--bid-price", "0.15", "--yes"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "--bid_price 0.1500" in create.read_text(encoding="utf-8")
+
+
+def test_kva_new_bid_pct_capped_at_max_dph(tmp_path):
+    create = tmp_path / "create.args"
+    env = _kva_new_env(tmp_path, [_offer(11, dph=0.3)], create_log=create)
+    r = subprocess.run(
+        ["bash", str(KVA), "new", "--size", "medium", "--max-dph", "0.32", "--bid-pct", "50", "--yes"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "--bid_price 0.3200" in create.read_text(encoding="utf-8")
+
+
+def test_kva_new_n_selects_next_offer(tmp_path):
+    create = tmp_path / "create.args"
+    env = _kva_new_env(
+        tmp_path,
+        [_offer(11, gpu="RTX 5090"), _offer(22, gpu="L40S", dph=0.4)],
+        create_log=create,
+    )
+    r = subprocess.run(
+        ["bash", str(KVA), "new", "--size", "medium"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        input="n\ny\n",
+    )
+    assert r.returncode == 0, r.stderr
+    assert "skipping offer 11" in r.stdout
+    assert "offer 2/2" in r.stdout
+    assert "L40S" in r.stdout
+    text = create.read_text(encoding="utf-8")
+    assert "create instance 22" in text
+    assert "create instance 11" not in text
+
+
+def test_kva_new_q_quits(tmp_path):
+    create = tmp_path / "create.args"
+    env = _kva_new_env(tmp_path, [_offer(11), _offer(22)], create_log=create)
+    r = subprocess.run(
+        ["bash", str(KVA), "new", "--size", "medium"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        input="q\n",
+    )
+    assert r.returncode == 1
+    assert "cancelled" in r.stderr
+    assert not create.exists()
+
+
+def test_kva_new_taken_offer_tries_next(tmp_path):
+    create = tmp_path / "create.args"
+    env = _kva_new_env(
+        tmp_path,
+        [_offer(11), _offer(22, gpu="L40S")],
+        create_log=create,
+        fail_create_ids="11",
+    )
+    r = subprocess.run(
+        ["bash", str(KVA), "new", "--size", "medium", "--yes"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "no longer available" in r.stdout
+    text = create.read_text(encoding="utf-8")
+    assert "create instance 11" in text
+    assert "create instance 22" in text
+    assert "created instance 777" in r.stdout
+
+
+def test_kva_resume_requires_session(tmp_path):
+    r = subprocess.run(
+        ["bash", str(KVA), "resume"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=_bare_env(tmp_path),
+    )
+    assert r.returncode == 1
+    assert "missing -s" in r.stderr
+
+
+def _stopped_instance_json(*, dph: float = 0.08, is_bid: bool = True) -> str:
+    return json.dumps(
+        {
+            "id": 99,
+            "actual_status": "stopped",
+            "gpu_name": "RTX 3060",
+            "dph_total": dph,
+            "is_bid": is_bid,
+        }
+    )
+
+
+def _running_instance_json(*, dph: float = 0.08) -> str:
+    return json.dumps(
+        {
+            "id": 99,
+            "actual_status": "running",
+            "gpu_name": "RTX 3060",
+            "dph_total": dph,
+            "is_bid": True,
+        }
+    )
+
+
+def test_kva_resume_dry_run_raises_bid(tmp_path):
+    env = _fake_vastai_env(tmp_path, instances_json="[]", instance_json=_stopped_instance_json())
+    r = subprocess.run(
+        ["bash", str(KVA), "resume", "-s", "99", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "current bid: $0.0800 / hour" in r.stdout
+    assert "new bid:     $0.0960 / hour" in r.stdout
+    assert "change bid 99 --price 0.0960" in r.stdout
+    assert "start instance 99" in r.stdout
+    assert not (tmp_path / "change.args").exists()
+    assert not (tmp_path / "start.args").exists()
+
+
+def test_kva_resume_bid_price_override(tmp_path):
+    env = _fake_vastai_env(tmp_path, instances_json="[]", instance_json=_stopped_instance_json())
+    r = subprocess.run(
+        ["bash", str(KVA), "resume", "-s", "99", "--bid-price", "0.15", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "new bid:     $0.1500 / hour" in r.stdout
+    assert "change bid 99 --price 0.1500" in r.stdout
+
+
+def test_kva_resume_bid_pct(tmp_path):
+    env = _fake_vastai_env(tmp_path, instances_json="[]", instance_json=_stopped_instance_json())
+    r = subprocess.run(
+        ["bash", str(KVA), "resume", "-s", "99", "--bid-pct", "50", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "new bid:     $0.1200 / hour" in r.stdout
+    assert "change bid 99 --price 0.1200" in r.stdout
+
+
+def test_kva_resume_already_running(tmp_path):
+    env = _fake_vastai_env(tmp_path, instances_json="[]", instance_json=_running_instance_json())
+    r = subprocess.run(
+        ["bash", str(KVA), "resume", "-s", "99", "--dry-run"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "already running ($0.0800/hr)" in r.stdout
+    assert "change bid" not in r.stdout
+
+
+def test_kva_resume_yes_changes_bid_and_starts(tmp_path):
+    change = tmp_path / "change.args"
+    start = tmp_path / "start.args"
+    env = _fake_vastai_env(
+        tmp_path,
+        instances_json="[]",
+        instance_json=_stopped_instance_json(),
+        running_json=_running_instance_json(dph=0.096),
+        change_log=change,
+        start_log=start,
+    )
+    r = subprocess.run(
+        ["bash", str(KVA), "resume", "-s", "99", "--yes"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "bid 99 -> $0.0960/hr" in r.stdout
+    assert "starting instance 99" in r.stdout
+    assert "status=running" in r.stdout
+    assert "change bid 99 --price 0.0960" in change.read_text(encoding="utf-8")
+    assert "start instance 99" in start.read_text(encoding="utf-8")
+
+
+def test_kva_resume_no_tty_without_yes(tmp_path):
+    env = _fake_vastai_env(tmp_path, instances_json="[]", instance_json=_stopped_instance_json())
+    r = subprocess.run(
+        ["bash", str(KVA), "resume", "-s", "99"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+        stdin=subprocess.DEVNULL,
+    )
+    assert r.returncode == 1
+    assert "without a TTY" in r.stderr
+
+
 def test_kva_exec_requires_session_and_file(tmp_path):
     r = subprocess.run(
         ["bash", str(KVA), "exec"],
@@ -173,11 +547,25 @@ def _fake_vastai_env(
     instances_json: str,
     destroy_log: Path | None = None,
     instance_json: str | None = None,
+    start_log: Path | None = None,
+    change_log: Path | None = None,
+    running_json: str | None = None,
+    search_json: str | None = None,
+    search_log: Path | None = None,
+    create_log: Path | None = None,
+    fail_create_ids: str = "",
 ) -> dict[str, str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     log = destroy_log or (tmp_path / "destroy.args")
+    start = start_log or (tmp_path / "start.args")
+    change = change_log or (tmp_path / "change.args")
+    search = search_log or (tmp_path / "search.args")
+    create = create_log or (tmp_path / "create.args")
+    state = tmp_path / "instance.state"
     inst = instance_json or "{}"
+    running = running_json or inst
+    offers = search_json or "[]"
     script = bin_dir / "vastai"
     script.write_text(
         "\n".join(
@@ -186,16 +574,100 @@ def _fake_vastai_env(
                 "import sys",
                 "from pathlib import Path",
                 f"LOG = Path({str(log)!r})",
+                f"START = Path({str(start)!r})",
+                f"CHANGE = Path({str(change)!r})",
+                f"SEARCH = Path({str(search)!r})",
+                f"CREATE = Path({str(create)!r})",
+                f"STATE = Path({str(state)!r})",
                 f"INSTANCES = {instances_json!r}",
                 f"INSTANCE = {inst!r}",
+                f"RUNNING = {running!r}",
+                f"OFFERS = {offers!r}",
+                f"FAIL_IDS = {{x for x in {fail_create_ids!r}.split(',') if x}}",
                 "if sys.argv[1:3] == ['show', 'instances']:",
                 "    print(INSTANCES)",
                 "    raise SystemExit(0)",
                 "if sys.argv[1:3] == ['show', 'instance']:",
-                "    print(INSTANCE)",
+                "    print(RUNNING if STATE.exists() else INSTANCE)",
                 "    raise SystemExit(0)",
                 "if sys.argv[1:3] == ['destroy', 'instance']:",
                 "    LOG.write_text(' '.join(sys.argv[1:]))",
+                "    raise SystemExit(0)",
+                "if sys.argv[1:3] == ['change', 'bid']:",
+                "    CHANGE.write_text(' '.join(sys.argv[1:]))",
+                "    print('{\"success\": true}')",
+                "    raise SystemExit(0)",
+                "if sys.argv[1:3] == ['start', 'instance']:",
+                "    START.write_text(' '.join(sys.argv[1:]))",
+                "    STATE.write_text('running')",
+                "    print('{\"success\": true}')",
+                "    raise SystemExit(0)",
+                "if sys.argv[1:3] == ['search', 'offers']:",
+                "    SEARCH.write_text(' '.join(sys.argv[1:]))",
+                "    print(OFFERS)",
+                "    raise SystemExit(0)",
+                "if sys.argv[1:3] == ['create', 'instance']:",
+                "    oid = sys.argv[3] if len(sys.argv) > 3 else ''",
+                "    prev = CREATE.read_text() if CREATE.exists() else ''",
+                "    CREATE.write_text(prev + ' '.join(sys.argv[1:]) + chr(10))",
+                "    if oid in FAIL_IDS:",
+                "        print('{\"error\": true, \"status_code\": 410, \"msg\": \"no_such_ask gone\"}')",
+                "        raise SystemExit(0)",
+                "    print('{\"success\": true, \"new_contract\": 777}')",
+                "    STATE.write_text('running')",
+                "    raise SystemExit(0)",
+                "print('unexpected:', ' '.join(sys.argv[1:]), file=sys.stderr)",
+                "raise SystemExit(1)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+    env.pop("VAST_INSTANCE_ID", None)
+    env["KVA_CONFIG"] = str(tmp_path / "kva.config")
+    return env
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    log = destroy_log or (tmp_path / "destroy.args")
+    start = start_log or (tmp_path / "start.args")
+    change = change_log or (tmp_path / "change.args")
+    state = tmp_path / "instance.state"
+    inst = instance_json or "{}"
+    running = running_json or inst
+    script = bin_dir / "vastai"
+    script.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import sys",
+                "from pathlib import Path",
+                f"LOG = Path({str(log)!r})",
+                f"START = Path({str(start)!r})",
+                f"CHANGE = Path({str(change)!r})",
+                f"STATE = Path({str(state)!r})",
+                f"INSTANCES = {instances_json!r}",
+                f"INSTANCE = {inst!r}",
+                f"RUNNING = {running!r}",
+                "if sys.argv[1:3] == ['show', 'instances']:",
+                "    print(INSTANCES)",
+                "    raise SystemExit(0)",
+                "if sys.argv[1:3] == ['show', 'instance']:",
+                "    print(RUNNING if STATE.exists() else INSTANCE)",
+                "    raise SystemExit(0)",
+                "if sys.argv[1:3] == ['destroy', 'instance']:",
+                "    LOG.write_text(' '.join(sys.argv[1:]))",
+                "    raise SystemExit(0)",
+                "if sys.argv[1:3] == ['change', 'bid']:",
+                "    CHANGE.write_text(' '.join(sys.argv[1:]))",
+                "    print('{\"success\": true}')",
+                "    raise SystemExit(0)",
+                "if sys.argv[1:3] == ['start', 'instance']:",
+                "    START.write_text(' '.join(sys.argv[1:]))",
+                "    STATE.write_text('running')",
+                "    print('{\"success\": true}')",
                 "    raise SystemExit(0)",
                 "print('unexpected:', ' '.join(sys.argv[1:]), file=sys.stderr)",
                 "raise SystemExit(1)",
