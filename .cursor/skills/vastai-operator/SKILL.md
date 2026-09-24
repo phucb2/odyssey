@@ -152,8 +152,9 @@ Sort (`-o` / `--order`): `score` (default), `dlperf_usd`, `dph_total`, `num_gpus
   kva exec -s <INSTANCE_ID> -f src/odyssey/experiments/3d/ex1.py
   kva exec -s <INSTANCE_ID> -f src/odyssey/experiments/3d/ex1.py --setup
   kva exec -s <INSTANCE_ID> -f src/odyssey/experiments/3d/ex1.py --detach
+  kva exec -f /path/to/train.py
   ```
-  `-s` is the Vast instance ID (or `$VAST_INSTANCE_ID`). Logs: `runs/kva/<timestamp>_<stem>.log` locally and `/workspace/odyssey/runs/kva/` on the host. `--setup` runs `pip install -e .` after sync. `--no-sync` skips rsync. Default output is quiet (`ssh -q`, no MOTD); `KVA_VERBOSE=1` or `KVA_LOG=all` prints ssh/rsync details and the Vast banner.
+  `-s` is the Vast instance ID (or `$VAST_INSTANCE_ID`). Logs: `runs/kva/<timestamp>_<stem>.log` locally and `/workspace/odyssey/runs/kva/` on the host. `--setup` runs `pip install -e .` after sync. `--no-sync` skips rsync. `-f` may be cwd-relative, repo-relative, or absolute; files outside the Odyssey repo are uploaded to `/workspace/kva-exec/`. Default output is quiet (`ssh -q`, no MOTD); `KVA_VERBOSE=1` or `KVA_LOG=all` prints ssh/rsync details and the Vast banner.
 - Manual copy then run:
   ```bash
   kva upload -s <ID> ./script.py /workspace/script.py

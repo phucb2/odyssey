@@ -72,11 +72,14 @@ kva sessions:
 
 kva exec:
   -s, --session ID   Vast.ai instance ID (overrides current-context / $VAST_INSTANCE_ID)
-  -f, --file PATH    Local script to run on the host (repo-relative)
+  -f, --file PATH    Local script: cwd-relative, repo-relative, or absolute
   --setup            pip install -e . on the host after sync
   --detach           nohup the job; print log paths and exit
-  --no-sync          skip rsync (source already on the host)
+  --no-sync          skip repo rsync (source already on the host)
   -h, --help         show this help
+
+  Paths inside the Odyssey repo are run after the usual repo rsync.
+  Paths outside it are uploaded to /workspace/kva-exec/ and run from there.
 
 kva upload / download:
   -s, --session ID   Vast.ai instance ID (overrides current-context / $VAST_INSTANCE_ID)
@@ -389,20 +392,38 @@ kva_download() {
   run_rsync_transfer "$remote_spec" "$dest" "$TRANSFER_DRY"
 }
 
-repo_rel_script() {
-  local f=$1 abs rel
-  if [[ "$f" != /* ]]; then
-    abs="$REPO_ROOT/$f"
-  else
+resolve_script() {
+  local f=$1 abs
+  if [[ "$f" == /* ]]; then
     abs=$f
+  elif [[ -f "$f" ]]; then
+    abs=$f
+  else
+    abs="$REPO_ROOT/$f"
   fi
   [[ -f "$abs" ]] || die "script not found: $f"
   abs=$(cd "$(dirname "$abs")" && pwd)/$(basename "$abs")
+  LOCAL_SCRIPT=$abs
   case "$abs" in
-    "$REPO_ROOT"/*) rel=${abs#"$REPO_ROOT"/} ;;
-    *) die "script is outside the repo: $abs" ;;
+    "$REPO_ROOT"/*)
+      REL_SCRIPT=${abs#"$REPO_ROOT"/}
+      EXT_SCRIPT=0
+      ;;
+    *)
+      REL_SCRIPT="/workspace/kva-exec/$(basename "$abs")"
+      EXT_SCRIPT=1
+      ;;
   esac
-  REL_SCRIPT=$rel
+}
+
+upload_script() {
+  local dest_dir dest
+  dest_dir=$(dirname "$REL_SCRIPT")
+  dest=${SSH_USERHOST}:${REL_SCRIPT}
+  kva_log "uploading $LOCAL_SCRIPT -> $dest"
+  remote_ssh "mkdir -p $(quote_remote "$dest_dir")"
+  require_cmd rsync
+  rsync -az -e "$(rsync_ssh)" "$LOCAL_SCRIPT" "$dest"
 }
 
 sync_repo() {
@@ -930,7 +951,7 @@ kva_exec() {
 
   require_instance
   [[ -n "$script_file" ]] || die "missing -f SCRIPT.py"
-  repo_rel_script "$script_file"
+  resolve_script "$script_file"
   parse_ssh_url
 
   local stamp stem
@@ -946,6 +967,9 @@ kva_exec() {
     kva_log "ssh -i $SSH_IDENTITY -p $SSH_PORT $SSH_USERHOST"
     kva_log "syncing $REPO_ROOT -> $SSH_USERHOST:$REMOTE_DIR"
     sync_repo
+  fi
+  if [[ "$EXT_SCRIPT" -eq 1 ]]; then
+    upload_script
   fi
   remote_ssh "mkdir -p $(quote_remote "$REMOTE_DIR/runs/kva")"
   if [[ "$setup" -eq 1 ]]; then

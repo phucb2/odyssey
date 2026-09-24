@@ -38,6 +38,7 @@ def test_kva_help():
     assert "current-context" in r.stdout
     assert "KVA_VERBOSE=1" in r.stdout
     assert "id_ed25519" in r.stdout
+    assert "/workspace/kva-exec/" in r.stdout
 
 
 def test_kva_unknown_command():
@@ -539,6 +540,107 @@ def test_kva_exec_missing_script(tmp_path, monkeypatch):
     )
     assert r.returncode == 1
     assert "script not found" in r.stderr
+
+
+def _fake_ssh_rsync_env(tmp_path: Path) -> dict[str, str]:
+    env = _transfer_env(tmp_path)
+    bin_dir = Path(env["PATH"].split(os.pathsep)[0])
+    ssh_log = tmp_path / "ssh.args"
+    rsync_log = tmp_path / "rsync.args"
+    ssh = bin_dir / "ssh"
+    ssh.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import sys",
+                "from pathlib import Path",
+                f"LOG = Path({str(ssh_log)!r})",
+                "prev = LOG.read_text() if LOG.exists() else ''",
+                "LOG.write_text(prev + ' '.join(sys.argv[1:]) + chr(10))",
+                "raise SystemExit(0)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    ssh.chmod(0o755)
+    rsync = bin_dir / "rsync"
+    rsync.write_text(
+        "\n".join(
+            [
+                "#!/usr/bin/env python3",
+                "import sys",
+                "from pathlib import Path",
+                f"LOG = Path({str(rsync_log)!r})",
+                "prev = LOG.read_text() if LOG.exists() else ''",
+                "LOG.write_text(prev + ' '.join(sys.argv[1:]) + chr(10))",
+                "raise SystemExit(0)",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    rsync.chmod(0o755)
+    env["KVA_SSH_LOG"] = str(ssh_log)
+    env["KVA_RSYNC_LOG"] = str(rsync_log)
+    return env
+
+
+def test_kva_exec_uploads_absolute_outside_path(tmp_path):
+    script = tmp_path / "train.py"
+    script.write_text("print(1)\n", encoding="utf-8")
+    env = _fake_ssh_rsync_env(tmp_path)
+    r = subprocess.run(
+        ["bash", str(KVA), "exec", "-s", "99", "-f", str(script), "--no-sync"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "outside the repo" not in r.stderr
+    rsync_log = Path(env["KVA_RSYNC_LOG"]).read_text(encoding="utf-8")
+    assert str(script) in rsync_log
+    assert "/workspace/kva-exec/train.py" in rsync_log
+    ssh_log = Path(env["KVA_SSH_LOG"]).read_text(encoding="utf-8")
+    assert "python3 -u /workspace/kva-exec/train.py" in ssh_log
+
+
+def test_kva_exec_cwd_relative_outside_path(tmp_path, monkeypatch):
+    script = tmp_path / "notebooks"
+    script.mkdir()
+    py = script / "colab_rsna.py"
+    py.write_text("print(1)\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    env = _fake_ssh_rsync_env(tmp_path)
+    r = subprocess.run(
+        ["bash", str(KVA), "exec", "-s", "99", "-f", "notebooks/colab_rsna.py", "--no-sync"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    rsync_log = Path(env["KVA_RSYNC_LOG"]).read_text(encoding="utf-8")
+    assert str(py.resolve()) in rsync_log
+    assert "/workspace/kva-exec/colab_rsna.py" in rsync_log
+
+
+def test_kva_exec_repo_relative_skips_extra_upload(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    env = _fake_ssh_rsync_env(tmp_path)
+    r = subprocess.run(
+        ["bash", str(KVA), "exec", "-s", "99", "-f", "notebooks/colab_odyssey.py", "--no-sync"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 0, r.stderr
+    rsync_log = Path(env["KVA_RSYNC_LOG"])
+    assert not rsync_log.exists() or "/workspace/kva-exec/" not in rsync_log.read_text(encoding="utf-8")
+    ssh_log = Path(env["KVA_SSH_LOG"]).read_text(encoding="utf-8")
+    assert "python3 -u notebooks/colab_odyssey.py" in ssh_log
 
 
 def _fake_vastai_env(

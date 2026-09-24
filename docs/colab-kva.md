@@ -135,7 +135,7 @@ Spot can be outbid → instance `stopped` (disk still bills). Recover with `kva 
 
 ### Files
 
-`kva exec` rsyncs the repo to `/workspace/odyssey` (skips `.venv/`, `.git/`, `datasets/`, `checkpoints/`, `runs/`). `--no-sync` skips rsync. `--setup` runs `pip install -e .` after sync.
+`kva exec` rsyncs the repo to `/workspace/odyssey` (skips `.venv/`, `.git/`, `datasets/`, `checkpoints/`, `runs/`). `--no-sync` skips rsync. `--setup` runs `pip install -e .` after sync. `-f` may be cwd-relative, repo-relative, or an absolute path; files outside the Odyssey repo are uploaded to `/workspace/kva-exec/` and run from there.
 
 ```bash
 kva upload ./datasets/coco128/raw/coco128.zip      # → /workspace/
